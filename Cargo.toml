@@ -1,0 +1,16 @@
+[package]
+name = "taskbar_audio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+windows = { version = "0.58", default-features = false, features = ["Foundation_Numerics", "Win32_Foundation", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_Media_KernelStreaming", "Win32_Media_Multimedia", "Win32_Security", "Win32_System_Com", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+winreg = "0.55"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }
