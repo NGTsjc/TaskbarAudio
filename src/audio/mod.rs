@@ -5,9 +5,7 @@ mod types;
 
 use std::sync::OnceLock;
 pub use loopback::{AudioStream, LoopbackCapture, LoopbackCaptureConfig};
-pub use queue::AudioQueue;
-pub use spectrum::{SpectrumAnalyzer, SpectrumConfig, SpectrumFrame, WindowFunction};
-pub use types::{AudioBlock, AudioEnergy, AudioFormat};
+pub use spectrum::{SpectrumAnalyzer, SpectrumConfig, SpectrumFrame};
 
 static GLOBAL_STREAM: OnceLock<AudioStream> = OnceLock::new();
 

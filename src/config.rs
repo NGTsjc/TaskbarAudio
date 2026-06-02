@@ -23,6 +23,19 @@ impl UiConfig {
     pub const CONTENT_PAD_BOTTOM_PX: f32 = 0.0;
     pub const CONTENT_BOTTOM_FUDGE_PX: f32 = 8.0;
     pub const MIN_BAR_HEIGHT_PX: f32 = 3.0;
+    pub const PEAK_HEIGHT_PX: f32 = 2.0;
+    pub const PEAK_GAP_PX: f32 = 1.0;
+    pub const PEAK_COLOR_R: f32 = 0.90;
+    pub const PEAK_COLOR_G: f32 = 0.98;
+    pub const PEAK_COLOR_B: f32 = 1.00;
+    pub const GRADIENT_BOTTOM_R: f32 = 0.62;
+    pub const GRADIENT_BOTTOM_G: f32 = 0.90;
+    pub const GRADIENT_BOTTOM_B: f32 = 1.00;
+    pub const GRADIENT_TOP_R: f32 = 0.90;
+    pub const GRADIENT_TOP_G: f32 = 0.98;
+    pub const GRADIENT_TOP_B: f32 = 1.00;
+    pub const GRADIENT_SHIMMER_SPEED: f32 = 0.35;
+    pub const GRADIENT_SHIMMER_STRENGTH: f32 = 0.18;
     // 控制台行为：true=关掉启动终端时跟随退出；false=忽略 CTRL_CLOSE，靠托盘退出
     pub const EXIT_ON_CONSOLE_CLOSE: bool = false;
 }
@@ -41,6 +54,10 @@ impl SpectrumDefaults {
     // 柱体映射（更“满”的动态范围）
     pub const BAR_GAIN: f32 = 3.10;
     pub const BAR_POW: f32 = 0.50;
+    // 渲染平滑（更“弹”的视觉）
+    pub const VIS_ATTACK_MS: f32 = 45.0;
+    pub const VIS_RELEASE_MS: f32 = 140.0;
+    pub const PEAK_FALL_PER_SEC: f32 = 1.35;
     // 柱体强弱对颜色的影响（只变亮度，不用透明度）
     pub const COLOR_GLOW_BASE: f32 = 0.78;
     pub const COLOR_GLOW_RANGE: f32 = 0.22;

@@ -4,7 +4,7 @@ use crate::win32::panel_render::PanelRenderer;
 use std::time::{Duration, Instant};
 use windows::core::w;
 use windows::Win32::Foundation::{
-    GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SetLastError, WIN32_ERROR, WPARAM, COLORREF,
+    GetLastError, HWND, LPARAM, LRESULT, RECT, SetLastError, WIN32_ERROR, WPARAM, COLORREF,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, MONITORINFO,
@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NCHITTEST, WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_TIMER, WINDOW_EX_STYLE, WINDOW_STYLE,
     WNDCLASSW,
     WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 const RETRY_TIMER_ID: usize = 1;
@@ -160,6 +160,10 @@ struct TaskbarEmbedController {
     last_layout: Option<(i32, i32, i32, i32)>,
     watchdog_recover_count: u64,
     layout_update_count: u64,
+    pending_show: bool,
+    pending_since: Instant,
+    stable_client_ticks: u32,
+    last_shell_client: Option<(i32, i32)>,
 }
 
 struct PanelWindowState {
@@ -232,6 +236,10 @@ impl TaskbarEmbedController {
                 last_layout: None,
                 watchdog_recover_count: 0,
                 layout_update_count: 0,
+                pending_show: false,
+                pending_since: Instant::now(),
+                stable_client_ticks: 0,
+                last_shell_client: None,
             })
         }
     }
@@ -257,9 +265,11 @@ impl TaskbarEmbedController {
                 return Ok(false);
             }
             self.attach_to_shell(shell)?;
-            self.update_layout(shell)?;
-            let _ = ShowWindow(self.panel_hwnd, SW_SHOWNOACTIVATE);
             self.tray_only = false;
+            self.pending_show = true;
+            self.pending_since = Instant::now();
+            self.stable_client_ticks = 0;
+            self.last_shell_client = None;
             Ok(true)
         }
     }
@@ -290,12 +300,50 @@ impl TaskbarEmbedController {
                     }
                 }
             }
+        }
+        let mut client = RECT::default();
+        let _ = unsafe { GetClientRect(shell, &mut client) };
+        let client_w = client.right - client.left;
+        let client_h = client.bottom - client.top;
+
+        let laid_out = self.update_layout(shell).unwrap_or(false);
+        unsafe {
+            if !laid_out {
+                self.pending_show = true;
+                self.pending_since = Instant::now();
+                self.stable_client_ticks = 0;
+                self.last_shell_client = None;
+                if IsWindowVisible(self.panel_hwnd).as_bool() {
+                    let _ = ShowWindow(self.panel_hwnd, SW_HIDE);
+                }
+                return;
+            }
+
+            if client_w > 0 && client_h > 0 {
+                if self.last_shell_client == Some((client_w, client_h)) {
+                    self.stable_client_ticks = self.stable_client_ticks.saturating_add(1);
+                } else {
+                    self.stable_client_ticks = 0;
+                    self.last_shell_client = Some((client_w, client_h));
+                }
+            }
+
+            if self.pending_show {
+                let should_show = self.stable_client_ticks >= 2
+                    || self.pending_since.elapsed() >= Duration::from_millis(500);
+                if should_show {
+                    let _ = ShowWindow(self.panel_hwnd, SW_SHOWNOACTIVATE);
+                    self.pending_show = false;
+                    self.watchdog_recover_count = self.watchdog_recover_count.saturating_add(1);
+                }
+                return;
+            }
+
             if !IsWindowVisible(self.panel_hwnd).as_bool() {
                 let _ = ShowWindow(self.panel_hwnd, SW_SHOWNOACTIVATE);
                 self.watchdog_recover_count = self.watchdog_recover_count.saturating_add(1);
             }
         }
-        let _ = self.update_layout(shell);
     }
 
     fn attach_to_shell(&mut self, shell: HWND) -> anyhow::Result<()> {
@@ -307,7 +355,7 @@ impl TaskbarEmbedController {
             let old_style = GetWindowLongPtrW(self.panel_hwnd, GWL_STYLE) as u32;
             let mut new_style = WINDOW_STYLE(old_style);
             new_style &= !WS_POPUP;
-            new_style |= WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
+            new_style |= WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
             SetWindowLongPtrW(self.panel_hwnd, GWL_STYLE, new_style.0 as isize);
             let required_ex: WINDOW_EX_STYLE =
                 WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED;
@@ -320,14 +368,14 @@ impl TaskbarEmbedController {
         }
     }
 
-    fn update_layout(&mut self, shell: HWND) -> anyhow::Result<()> {
+    fn update_layout(&mut self, shell: HWND) -> anyhow::Result<bool> {
         unsafe {
             let mut rc = RECT::default();
             GetClientRect(shell, &mut rc)?;
             let client_w = rc.right - rc.left;
             let client_h = rc.bottom - rc.top;
             if client_w <= 0 || client_h <= 0 {
-                return Ok(());
+                return Ok(false);
             }
             let panel_width = UiConfig::PANEL_WIDTH_PX.min(client_w).max(1);
             let shell_rect = get_window_rect(shell)?;
@@ -369,7 +417,7 @@ impl TaskbarEmbedController {
                 }
             }
             self.last_layout = Some(layout);
-            Ok(())
+            Ok(true)
         }
     }
 
@@ -379,6 +427,9 @@ impl TaskbarEmbedController {
         }
         self.tray_only = true;
         self.last_layout = None;
+        self.pending_show = false;
+        self.stable_client_ticks = 0;
+        self.last_shell_client = None;
     }
 
     fn is_tray_only(&self) -> bool {

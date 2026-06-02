@@ -91,9 +91,9 @@ fn show_context_menu(message_hwnd: HWND) {
 }
 
 unsafe fn load_icon() -> HICON {
-    let instance = GetModuleHandleW(None).ok();
+    let instance = unsafe { GetModuleHandleW(None) }.ok();
     if let Some(instance) = instance {
-        if let Ok(icon) = LoadIconW(instance, w!("MAINICON")) {
+        if let Ok(icon) = unsafe { LoadIconW(instance, w!("MAINICON")) } {
             if !icon.is_invalid() {
                 return icon;
             }
