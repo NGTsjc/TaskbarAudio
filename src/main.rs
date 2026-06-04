@@ -5,6 +5,7 @@ mod audio;
 mod config;
 mod logging;
 mod single_instance;
+mod user_config;
 mod win32;
 
 fn main() {
@@ -17,5 +18,6 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let _logging_guard = logging::init()?;
     logging::install_panic_hook();
+    user_config::load_user_config()?;
     app::run()
 }

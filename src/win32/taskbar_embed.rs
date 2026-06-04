@@ -1,5 +1,6 @@
 use crate::audio;
 use crate::config::UiConfig;
+use crate::user_config::get_user_config;
 use crate::win32::panel_render::PanelRenderer;
 use std::time::{Duration, Instant};
 use windows::core::w;
@@ -378,14 +379,21 @@ impl TaskbarEmbedController {
                 return Ok(false);
             }
             let panel_width = UiConfig::PANEL_WIDTH_PX.min(client_w).max(1);
-            let shell_rect = get_window_rect(shell)?;
-            let shell_w = shell_rect.right - shell_rect.left;
-            let inset_x = ((shell_w - client_w) / 2).max(0);
-            let screen_w = GetSystemMetrics(SM_CXSCREEN);
-            let target_center_screen = screen_w / 2;
-            let target_left_screen = (target_center_screen - (panel_width / 2)).max(0);
-            let mut x = (target_left_screen - shell_rect.left - inset_x).clamp(0, (client_w - panel_width).max(0));
-            let mut layout = (x, 0i32, panel_width, client_h);
+            let position = get_user_config().position.as_str();
+            let x = match position {
+                "left" => 0,
+                "right" => (client_w - panel_width).max(0),
+                _ => {
+                    let shell_rect = get_window_rect(shell)?;
+                    let shell_w = shell_rect.right - shell_rect.left;
+                    let inset_x = (shell_w - client_w) / 2;
+                    let screen_w = GetSystemMetrics(SM_CXSCREEN);
+                    let target_center_screen = screen_w / 2;
+                    let target_left_screen = (target_center_screen - (panel_width / 2)).max(0);
+                    (target_left_screen - shell_rect.left - inset_x).clamp(0, (client_w - panel_width).max(0))
+                }
+            };
+            let layout = (x, 0i32, panel_width, client_h);
             if self.last_layout != Some(layout) {
                 let _ = SetWindowPos(
                 self.panel_hwnd,
@@ -397,24 +405,6 @@ impl TaskbarEmbedController {
                 SWP_NOACTIVATE | SWP_FRAMECHANGED,
                 );
                 self.layout_update_count = self.layout_update_count.saturating_add(1);
-            }
-            if let Ok(panel_rect) = get_window_rect(self.panel_hwnd) {
-                let panel_center_x = (panel_rect.left + panel_rect.right) / 2;
-                let delta = target_center_screen - panel_center_x;
-                if delta.abs() > 1 {
-                    x = (x + delta).clamp(0, (client_w - panel_width).max(0));
-                    layout = (x, 0i32, panel_width, client_h);
-                    let _ = SetWindowPos(
-                        self.panel_hwnd,
-                        HWND_TOP,
-                        layout.0,
-                        layout.1,
-                        layout.2,
-                        layout.3,
-                        SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                    );
-                    self.layout_update_count = self.layout_update_count.saturating_add(1);
-                }
             }
             self.last_layout = Some(layout);
             Ok(true)

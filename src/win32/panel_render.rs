@@ -1,5 +1,6 @@
 use crate::audio::{self, SpectrumAnalyzer, SpectrumConfig};
 use crate::config::{SpectrumDefaults, UiConfig};
+use crate::user_config::get_user_config;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F,
@@ -93,7 +94,11 @@ impl PanelRenderer {
             rt.BeginDraw();
             rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
             rt.Clear(Some(&color_rgba(1.0, 0.0, 1.0, 1.0)));
-            self.draw_bars(&rt, client_size);
+            let display_mode = get_user_config().display_mode.as_str();
+            match display_mode {
+                "line" => self.draw_line(&rt, client_size),
+                _ => self.draw_bars(&rt, client_size),
+            }
             match rt.EndDraw(None, None) {
                 Ok(_) => Ok(()),
                 Err(err) => {
@@ -318,6 +323,50 @@ impl PanelRenderer {
                 rt.FillRectangle(&peak_rect, peak_brush);
             }
             bar_brush.SetOpacity(1.0);
+        }
+    }
+
+    fn draw_line(&mut self, rt: &ID2D1RenderTarget, client_size: D2D_SIZE_U) {
+        let Some(bar_brush) = &self.bar_brush else { return };
+        let bars = &self.display_bars;
+        if bars.is_empty() {
+            return;
+        }
+        let size_w = client_size.width as f32;
+        let size_h = client_size.height as f32;
+        let left = UiConfig::CONTENT_PAD_X_PX;
+        let right = (size_w - UiConfig::CONTENT_PAD_X_PX).max(left);
+        let top = UiConfig::CONTENT_PAD_TOP_PX;
+        let bottom = (size_h - UiConfig::CONTENT_PAD_BOTTOM_PX).max(top) + UiConfig::CONTENT_BOTTOM_FUDGE_PX;
+        let inner_h = (bottom - top).max(1.0);
+        let inner_w = (right - left).max(1.0);
+        let t = self.anim_start.elapsed().as_secs_f32();
+        let shimmer = (t * UiConfig::GRADIENT_SHIMMER_SPEED) % 1.0;
+        let shift = (shimmer * size_w * 2.0) - size_w;
+        unsafe {
+            bar_brush.SetStartPoint(D2D_POINT_2F { x: left + shift, y: bottom });
+            bar_brush.SetEndPoint(D2D_POINT_2F { x: right + shift, y: top });
+        }
+        let n = bars.len();
+        if n < 2 {
+            return;
+        }
+        let step_x = inner_w / (n - 1) as f32;
+        let mut points = Vec::with_capacity(n);
+        for (i, v) in bars.iter().copied().enumerate() {
+            let v = (v * SpectrumDefaults::BAR_GAIN)
+                .clamp(0.0, 1.0)
+                .powf(SpectrumDefaults::BAR_POW);
+            let h = (v * inner_h).max(UiConfig::MIN_BAR_HEIGHT_PX);
+            let x = left + i as f32 * step_x;
+            let y = bottom - h;
+            points.push(D2D_POINT_2F { x, y });
+        }
+        unsafe {
+            bar_brush.SetOpacity(1.0);
+            for i in 0..points.len() - 1 {
+                rt.DrawLine(points[i], points[i + 1], bar_brush, 2.0, None);
+            }
         }
     }
 }
