@@ -1,7 +1,8 @@
 use crate::audio;
 use crate::config::UiConfig;
-use crate::user_config::get_user_config;
+use crate::util::win32::get_window_rect;
 use crate::win32::panel_render::PanelRenderer;
+use crate::win32::taskbar_layout::{self, LayoutResult};
 use std::time::{Duration, Instant};
 use windows::core::w;
 use windows::Win32::Foundation::{
@@ -14,12 +15,11 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, GetClientRect, GetWindowLongPtrW,
-    GetParent, GetWindowRect, IsWindowVisible, KillTimer, PostMessageW, RegisterClassW,
-    GetSystemMetrics, SM_CXSCREEN,
-    SetLayeredWindowAttributes, SetParent, SetTimer, SendMessageW, SetWindowLongPtrW, SetWindowPos,
+    GetParent, IsWindowVisible, KillTimer, PostMessageW, RegisterClassW,
+    SetLayeredWindowAttributes, SetParent, SetTimer, SendMessageW, SetWindowLongPtrW,
     ShowWindow,
-    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, HMENU, HTTRANSPARENT, HWND_TOP,
-    MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE,
+    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, HMENU, HTTRANSPARENT,
+    MA_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE,
     TIMERPROC, LWA_COLORKEY, WM_APP, WM_CREATE, WM_DPICHANGED, WM_ERASEBKGND, WM_MOUSEACTIVATE,
     WM_NCHITTEST, WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_TIMER, WINDOW_EX_STYLE, WINDOW_STYLE,
     WNDCLASSW,
@@ -307,9 +307,13 @@ impl TaskbarEmbedController {
         let client_w = client.right - client.left;
         let client_h = client.bottom - client.top;
 
-        let laid_out = self.update_layout(shell).unwrap_or(false);
+        let layout_result = taskbar_layout::update_layout(shell, self.panel_hwnd, self.last_layout).unwrap_or(LayoutResult::Invalid);
+        if layout_result == LayoutResult::Updated {
+            self.last_layout = Some(taskbar_layout::calculate_layout(shell).unwrap_or((0, 0, 0, 0)));
+            self.layout_update_count = self.layout_update_count.saturating_add(1);
+        }
         unsafe {
-            if !laid_out {
+            if layout_result == LayoutResult::Invalid {
                 self.pending_show = true;
                 self.pending_since = Instant::now();
                 self.stable_client_ticks = 0;
@@ -369,48 +373,6 @@ impl TaskbarEmbedController {
         }
     }
 
-    fn update_layout(&mut self, shell: HWND) -> anyhow::Result<bool> {
-        unsafe {
-            let mut rc = RECT::default();
-            GetClientRect(shell, &mut rc)?;
-            let client_w = rc.right - rc.left;
-            let client_h = rc.bottom - rc.top;
-            if client_w <= 0 || client_h <= 0 {
-                return Ok(false);
-            }
-            let panel_width = UiConfig::PANEL_WIDTH_PX.min(client_w).max(1);
-            let position = get_user_config().position.as_str();
-            let x = match position {
-                "left" => 0,
-                "right" => (client_w - panel_width).max(0),
-                _ => {
-                    let shell_rect = get_window_rect(shell)?;
-                    let shell_w = shell_rect.right - shell_rect.left;
-                    let inset_x = (shell_w - client_w) / 2;
-                    let screen_w = GetSystemMetrics(SM_CXSCREEN);
-                    let target_center_screen = screen_w / 2;
-                    let target_left_screen = (target_center_screen - (panel_width / 2)).max(0);
-                    (target_left_screen - shell_rect.left - inset_x).clamp(0, (client_w - panel_width).max(0))
-                }
-            };
-            let layout = (x, 0i32, panel_width, client_h);
-            if self.last_layout != Some(layout) {
-                let _ = SetWindowPos(
-                self.panel_hwnd,
-                HWND_TOP,
-                layout.0,
-                layout.1,
-                layout.2,
-                layout.3,
-                SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                );
-                self.layout_update_count = self.layout_update_count.saturating_add(1);
-            }
-            self.last_layout = Some(layout);
-            Ok(true)
-        }
-    }
-
     fn set_tray_only(&mut self) {
         unsafe {
             let _ = ShowWindow(self.panel_hwnd, SW_HIDE);
@@ -434,14 +396,6 @@ impl Drop for TaskbarEmbedController {
                 let _ = DestroyWindow(self.panel_hwnd);
             }
         }
-    }
-}
-
-fn get_window_rect(hwnd: HWND) -> anyhow::Result<RECT> {
-    unsafe {
-        let mut rect = RECT::default();
-        GetWindowRect(hwnd, &mut rect)?;
-        Ok(rect)
     }
 }
 

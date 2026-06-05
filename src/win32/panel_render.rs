@@ -1,6 +1,6 @@
 use crate::audio::{self, SpectrumAnalyzer, SpectrumConfig};
 use crate::config::{SpectrumDefaults, UiConfig};
-use crate::user_config::get_user_config;
+use crate::config::user::get_user_config;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F,
