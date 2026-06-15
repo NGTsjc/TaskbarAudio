@@ -241,12 +241,40 @@ pub mod user {
     static USER_CONFIG: OnceLock<UserConfig> = OnceLock::new();
 
     pub fn load_user_config() -> anyhow::Result<()> {
-        let config = UserConfig::default();
+        let config = load_user_config_from_file()?;
         USER_CONFIG.set(config).map_err(|_| anyhow::anyhow!("user config already initialized"))?;
         Ok(())
     }
 
     pub fn get_user_config() -> &'static UserConfig {
         USER_CONFIG.get().expect("user config not initialized")
+    }
+
+    fn load_user_config_from_file() -> anyhow::Result<UserConfig> {
+        let exe_path = std::env::current_exe()?;
+        let exe_dir = exe_path.parent().ok_or_else(|| anyhow::anyhow!("exe has no parent directory"))?;
+        let config_path = exe_dir.join("config.json");
+        
+        if config_path.exists() {
+            let content = std::fs::read_to_string(&config_path)?;
+            match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(value) => {
+                    let user_config: UserConfig = if let Some(user) = value.get("user") {
+                        serde_json::from_value(user.clone())?
+                    } else {
+                        serde_json::from_str(&content)?
+                    };
+                    tracing::info!(path = %config_path.display(), "user config loaded");
+                    Ok(user_config)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %config_path.display(), "user config parse failed, using defaults");
+                    Ok(UserConfig::default())
+                }
+            }
+        } else {
+            tracing::debug!(path = %config_path.display(), "user config not found, using defaults");
+            Ok(UserConfig::default())
+        }
     }
 }
