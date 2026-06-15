@@ -1,6 +1,6 @@
 use crate::audio;
 use crate::config::UiConfig;
-use crate::util::win32::get_window_rect;
+use crate::util::win32::{get_window_rect, is_valid_shell_tray_wnd};
 use crate::win32::panel_render::PanelRenderer;
 use crate::win32::taskbar_layout::{self, LayoutResult};
 use std::time::{Duration, Instant};
@@ -14,8 +14,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, GetClassNameW, GetClientRect, GetWindowLongPtrW,
-    GetParent, IsWindow, IsWindowVisible, KillTimer, PostMessageW, RegisterClassW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, GetClientRect, GetWindowLongPtrW,
+    GetParent, IsWindowVisible, KillTimer, PostMessageW, RegisterClassW,
     SetLayeredWindowAttributes, SetParent, SetTimer, SendMessageW, SetWindowLongPtrW,
     ShowWindow,
     CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, HMENU, HTTRANSPARENT,
@@ -31,24 +31,6 @@ const RETRY_TIMER_ID: usize = 1;
 const RENDER_TIMER_ID: usize = 2;
 const WATCHDOG_TIMER_ID: usize = 3;
 pub const WM_APP_RETRY_ATTACH: u32 = WM_APP + 1;
-
-/// 检查窗口是否是有效的 Shell_TrayWnd（任务栏窗口）
-fn is_valid_shell_tray_wnd(hwnd: HWND) -> bool {
-    if hwnd.0.is_null() {
-        return false;
-    }
-    if !unsafe { IsWindow(hwnd) }.as_bool() {
-        return false;
-    }
-    // 检查窗口类名是否是 Shell_TrayWnd
-    let mut class_name = [0u16; 256];
-    let len = unsafe { GetClassNameW(hwnd, &mut class_name) };
-    if len <= 0 {
-        return false;
-    }
-    let name = String::from_utf16_lossy(&class_name[..len as usize]);
-    name == "Shell_TrayWnd"
-}
 
 pub fn init(message_hwnd: HWND) -> anyhow::Result<()> {
     unsafe {

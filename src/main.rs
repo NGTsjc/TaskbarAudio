@@ -2,6 +2,7 @@
 
 mod audio;
 mod config;
+mod error;
 mod logging;
 mod single_instance;
 mod util;

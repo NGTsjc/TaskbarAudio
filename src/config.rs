@@ -1,8 +1,9 @@
 use serde::Deserialize;
 use std::sync::OnceLock;
 
-pub struct UiConfig;
-impl UiConfig {
+pub struct UiConfigConst;
+
+impl UiConfigConst {
     pub const PANEL_WIDTH_PX: i32 = 240;
     pub const COLORKEY_FUCHSIA_RGB: u32 = 0x00FF00FF;
     pub const WATCHDOG_INTERVAL_MS: u32 = 1000;
@@ -13,7 +14,7 @@ impl UiConfig {
     pub const RENDER_IDLE_AFTER_MS: u64 = 1500;
     pub const RENDER_DEEP_IDLE_AFTER_MS: u64 = 6000;
     pub const RENDER_DEEP_IDLE_INTERVAL_MS: u32 = 250;
-    pub const RENDER_ENERGY_ACTIVE_THRESHOLD: f32 = 0.04;
+    pub const RENDER_ENERGY_ACTIVE_THRESHOLD: f32 = 0.01;
     pub const BAR_COLOR_R: f32 = 0.58;
     pub const BAR_COLOR_G: f32 = 0.88;
     pub const BAR_COLOR_B: f32 = 1.00;
@@ -39,7 +40,180 @@ impl UiConfig {
     pub const EXIT_ON_CONSOLE_CLOSE: bool = false;
 }
 
+pub type UiConfig = UiConfigConst;
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct SpectrumConfig {
+    pub fft_size: usize,
+    pub bars: usize,
+    pub min_hz: f32,
+    pub max_hz: f32,
+    pub update_hz: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+    pub gamma: f32,
+    pub noise_floor: f32,
+    pub bar_gain: f32,
+    pub bar_pow: f32,
+    pub vis_attack_ms: f32,
+    pub vis_release_ms: f32,
+    pub peak_fall_per_sec: f32,
+    pub color_glow_base: f32,
+    pub color_glow_range: f32,
+    pub silent_decay: f32,
+}
+
+impl Default for SpectrumConfig {
+    fn default() -> Self {
+        Self {
+            fft_size: 512,
+            bars: 64,
+            min_hz: 40.0,
+            max_hz: 16_000.0,
+            update_hz: 90.0,
+            attack_ms: 15.0,
+            release_ms: 150.0,
+            gamma: 0.55,
+            noise_floor: 0.0,
+            bar_gain: 3.10,
+            bar_pow: 0.50,
+            vis_attack_ms: 20.0,
+            vis_release_ms: 100.0,
+            peak_fall_per_sec: 1.35,
+            color_glow_base: 0.78,
+            color_glow_range: 0.22,
+            silent_decay: 0.985,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct UserConfig {
+    pub position: String,
+    pub display_mode: String,
+    pub offset_x: i32,
+}
+
+impl Default for UserConfig {
+    fn default() -> Self {
+        Self {
+            position: "center".to_string(),
+            display_mode: "bar".to_string(),
+            offset_x: 0,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct AudioConfig {
+    pub block_frames: usize,
+    pub queue_capacity: usize,
+    pub no_data_fill_interval_ms: u64,
+    pub smooth_tau_ms: u64,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            block_frames: 1024,
+            queue_capacity: 8,
+            no_data_fill_interval_ms: 20,
+            smooth_tau_ms: 180,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct LoggingConfig {
+    pub level: String,
+    pub file_enabled: bool,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: "debug".to_string(),
+            file_enabled: false,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct AppConfig {
+    pub spectrum: SpectrumConfig,
+    pub user: UserConfig,
+    pub audio: AudioConfig,
+    pub logging: LoggingConfig,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            spectrum: SpectrumConfig::default(),
+            user: UserConfig::default(),
+            audio: AudioConfig::default(),
+            logging: LoggingConfig::default(),
+        }
+    }
+}
+
+static APP_CONFIG: OnceLock<AppConfig> = OnceLock::new();
+
+pub fn load_config() -> anyhow::Result<()> {
+    let config_path = config_file_path()?;
+    let config = if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path)?;
+        match serde_json::from_str::<AppConfig>(&content) {
+            Ok(cfg) => {
+                tracing::info!(path = %config_path.display(), "config loaded");
+                cfg
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %config_path.display(), "config parse failed, using defaults");
+                AppConfig::default()
+            }
+        }
+    } else {
+        tracing::debug!(path = %config_path.display(), "config not found, using defaults");
+        AppConfig::default()
+    };
+    APP_CONFIG.set(config).map_err(|_| anyhow::anyhow!("config already initialized"))?;
+    Ok(())
+}
+
+pub fn get_config() -> &'static AppConfig {
+    APP_CONFIG.get().expect("config not initialized")
+}
+
+pub fn get_spectrum_config() -> &'static SpectrumConfig {
+    &get_config().spectrum
+}
+
+pub fn get_user_config() -> &'static UserConfig {
+    &get_config().user
+}
+
+pub fn get_audio_config() -> &'static AudioConfig {
+    &get_config().audio
+}
+
+pub fn get_logging_config() -> &'static LoggingConfig {
+    &get_config().logging
+}
+
+fn config_file_path() -> anyhow::Result<std::path::PathBuf> {
+    let exe_path = std::env::current_exe()?;
+    let exe_dir = exe_path.parent().ok_or_else(|| anyhow::anyhow!("exe has no parent directory"))?;
+    Ok(exe_dir.join("config.json"))
+}
+
 pub struct SpectrumDefaults;
+
 impl SpectrumDefaults {
     pub const FFT_SIZE: usize = 1024;
     pub const BARS: usize = 64;
@@ -62,66 +236,17 @@ impl SpectrumDefaults {
 
 pub mod user {
     use super::*;
-
-    #[derive(Debug, Deserialize)]
-    pub struct UserConfig {
-        #[serde(default = "default_position")]
-        pub position: String,
-        #[serde(default = "default_display_mode")]
-        pub display_mode: String,
-        #[serde(default)]
-        pub offset_x: i32,
-    }
-
-    fn default_position() -> String {
-        "center".to_string()
-    }
-
-    fn default_display_mode() -> String {
-        "bar".to_string()
-    }
-
-    impl Default for UserConfig {
-        fn default() -> Self {
-            Self {
-                position: default_position(),
-                display_mode: default_display_mode(),
-                offset_x: 0,
-            }
-        }
-    }
+    use std::sync::OnceLock;
 
     static USER_CONFIG: OnceLock<UserConfig> = OnceLock::new();
 
     pub fn load_user_config() -> anyhow::Result<()> {
-        let config_path = config_file_path()?;
-        let config = if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)?;
-            match serde_json::from_str::<UserConfig>(&content) {
-                Ok(cfg) => {
-                    tracing::info!(path = %config_path.display(), position = cfg.position, display_mode = cfg.display_mode, offset_x = cfg.offset_x, "user config loaded");
-                    cfg
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, path = %config_path.display(), "user config parse failed, using defaults");
-                    UserConfig::default()
-                }
-            }
-        } else {
-            tracing::debug!(path = %config_path.display(), "user config not found, using defaults");
-            UserConfig::default()
-        };
+        let config = UserConfig::default();
         USER_CONFIG.set(config).map_err(|_| anyhow::anyhow!("user config already initialized"))?;
         Ok(())
     }
 
     pub fn get_user_config() -> &'static UserConfig {
         USER_CONFIG.get().expect("user config not initialized")
-    }
-
-    fn config_file_path() -> anyhow::Result<std::path::PathBuf> {
-        let exe_path = std::env::current_exe()?;
-        let exe_dir = exe_path.parent().ok_or_else(|| anyhow::anyhow!("exe has no parent directory"))?;
-        Ok(exe_dir.join("config.json"))
     }
 }

@@ -4,10 +4,7 @@ use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowFunction {
-    Rectangular,
     Hann,
-    Hamming,
-    Blackman,
 }
 
 impl Default for WindowFunction {
@@ -49,7 +46,6 @@ impl Default for SpectrumConfig {
 
 #[derive(Clone, Debug)]
 pub struct SpectrumFrame {
-    pub timestamp_qpc: i64,
     pub bars: Vec<f32>,
 }
 
@@ -59,7 +55,8 @@ pub struct SpectrumAnalyzer {
     mono_ring: VecDeque<f32>,
     fft_buf: Vec<Complex32>,
     prev_bars: Vec<f32>,
-    last_output_ts: Option<i64>,
+    last_output_frame: Option<usize>,
+    frame_count: usize,
 }
 
 impl SpectrumAnalyzer {
@@ -76,38 +73,21 @@ impl SpectrumAnalyzer {
             mono_ring: VecDeque::with_capacity(config.fft_size * 2),
             fft_buf,
             prev_bars: vec![0.0; config.bars],
-            last_output_ts: None,
+            last_output_frame: None,
+            frame_count: 0,
         })
-    }
-
-    pub fn config(&self) -> SpectrumConfig {
-        self.config
-    }
-
-    pub fn set_config(&mut self, config: SpectrumConfig) -> anyhow::Result<()> {
-        anyhow::ensure!(config.fft_size.is_power_of_two(), "fft_size must be power of two");
-        anyhow::ensure!(config.fft_size >= 16, "fft_size too small");
-        anyhow::ensure!(config.bars >= 1, "bars must be >= 1");
-        anyhow::ensure!(config.update_hz > 0.0, "update_hz must be > 0");
-        self.config = config;
-        self.window = build_window(config.fft_size, config.window);
-        self.fft_buf.resize(config.fft_size, Complex32::default());
-        self.prev_bars.resize(config.bars, 0.0);
-        self.mono_ring.truncate(0);
-        self.last_output_ts = None;
-        Ok(())
     }
 
     pub fn process_block(&mut self, block: &AudioBlock) -> Option<SpectrumFrame> {
         push_block_mono(&mut self.mono_ring, block);
+        self.frame_count += block.frames;
         if self.mono_ring.len() < self.config.fft_size {
             return None;
         }
-        let ts = block.timestamp_qpc;
-        if let Some(last_ts) = self.last_output_ts {
-            let min_dt_s = 1.0f32 / self.config.update_hz.max(1e-3);
-            let dt_s = ((ts - last_ts) as f32) * 1e-9;
-            if dt_s > 0.0 && dt_s < min_dt_s {
+        let frame_interval = (block.format.sample_rate as f32 / self.config.update_hz) as usize;
+        if let Some(last_frame) = self.last_output_frame {
+            let frames_since_last = self.frame_count - last_frame;
+            if frames_since_last < frame_interval {
                 return None;
             }
         }
@@ -133,11 +113,7 @@ impl SpectrumAnalyzer {
             self.config.gamma,
             self.config.noise_floor,
         );
-        let dt_s = if let Some(last_ts) = self.last_output_ts {
-            (((ts - last_ts) as f32) * 1e-9).max(0.0)
-        } else {
-            1.0f32 / self.config.update_hz.max(1e-3)
-        };
+        let dt_s = 1.0f32 / self.config.update_hz.max(1e-3);
         let attack_tau = (self.config.attack_ms.max(0.1) / 1000.0).max(1e-4);
         let release_tau = (self.config.release_ms.max(0.1) / 1000.0).max(1e-4);
         for (i, t) in target.iter().copied().enumerate() {
@@ -146,9 +122,8 @@ impl SpectrumAnalyzer {
             let a = 1.0 - (-dt_s / tau).exp();
             self.prev_bars[i] = (p + (t - p) * a).clamp(0.0, 1.0);
         }
-        self.last_output_ts = Some(ts);
+        self.last_output_frame = Some(self.frame_count);
         Some(SpectrumFrame {
-            timestamp_qpc: ts,
             bars: self.prev_bars.clone(),
         })
     }
@@ -176,7 +151,7 @@ fn push_block_mono(ring: &mut VecDeque<f32>, block: &AudioBlock) {
     }
 }
 
-fn build_window(n: usize, w: WindowFunction) -> Vec<f32> {
+fn build_window(n: usize, _w: WindowFunction) -> Vec<f32> {
     if n == 0 {
         return Vec::new();
     }
@@ -185,12 +160,7 @@ fn build_window(n: usize, w: WindowFunction) -> Vec<f32> {
     (0..n)
         .map(|i| {
             let x = i as f32 / n1;
-            match w {
-                WindowFunction::Rectangular => 1.0,
-                WindowFunction::Hann => 0.5 * (1.0 - (tau * x).cos()),
-                WindowFunction::Hamming => 0.54 - 0.46 * (tau * x).cos(),
-                WindowFunction::Blackman => 0.42 - 0.5 * (tau * x).cos() + 0.08 * (2.0 * tau * x).cos(),
-            }
+            0.5 * (1.0 - (tau * x).cos())
         })
         .collect()
 }
@@ -310,8 +280,6 @@ mod tests {
             format: crate::audio::types::AudioFormat { sample_rate: sr, channels: 1 },
             samples,
             frames,
-            energy: crate::audio::types::AudioEnergy::default(),
-            timestamp_qpc: 0,
         }
     }
 
@@ -331,8 +299,7 @@ mod tests {
         })
         .unwrap();
         let sr = 48_000;
-        let mut block = sine_block(1000.0, sr, 1024);
-        block.timestamp_qpc = 16_000_000;
+        let block = sine_block(1000.0, sr, 1024);
         let frame = a.process_block(&block).unwrap();
         let (max_i, max_v) = frame
             .bars

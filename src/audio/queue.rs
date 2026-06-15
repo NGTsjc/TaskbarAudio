@@ -19,13 +19,27 @@ impl AudioQueue {
     pub fn push(&self, block: AudioBlock) {
         let mut q = self.inner.lock().unwrap();
         while q.len() >= self.capacity {
-            q.pop_front();
+            let _ = q.pop_front();
         }
         q.push_back(block);
     }
 
     pub fn pop_latest(&self) -> Option<AudioBlock> {
         let mut q = self.inner.lock().unwrap();
+        if q.is_empty() {
+            return None;
+        }
+        let latest = q.pop_back();
+        q.clear();
+        latest
+    }
+
+    pub fn try_pop_latest(&self) -> Option<AudioBlock> {
+        let lock = self.inner.try_lock();
+        if lock.is_err() {
+            return None;
+        }
+        let mut q = lock.unwrap();
         if q.is_empty() {
             return None;
         }

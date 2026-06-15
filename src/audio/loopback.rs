@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use windows::Win32::Media::Audio::{
@@ -14,30 +14,27 @@ use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
 use crate::audio::queue::AudioQueue;
-use crate::audio::types::{AudioBlock, AudioEnergy, AudioFormat};
+use crate::audio::types::{AudioBlock, AudioFormat};
 
 #[derive(Clone, Copy, Debug)]
 pub struct LoopbackCaptureConfig {
     pub block_frames: usize,
     pub queue_capacity: usize,
     pub no_data_fill_interval: Duration,
-    pub smooth_tau: Duration,
 }
 
 impl Default for LoopbackCaptureConfig {
     fn default() -> Self {
         Self {
-            block_frames: 1024,
-            queue_capacity: 8,
-            no_data_fill_interval: Duration::from_millis(20),
-            smooth_tau: Duration::from_millis(180),
+            block_frames: 512,
+            queue_capacity: 4,
+            no_data_fill_interval: Duration::from_millis(10),
         }
     }
 }
 
 pub struct LoopbackCapture {
     queue: AudioQueue,
-    format: Arc<OnceLock<AudioFormat>>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -45,20 +42,15 @@ pub struct LoopbackCapture {
 #[derive(Clone)]
 pub struct AudioStream {
     queue: AudioQueue,
-    format: Arc<OnceLock<AudioFormat>>,
 }
 
 impl AudioStream {
     pub fn pop_latest(&self) -> Option<AudioBlock> {
-        self.queue.pop_latest()
+        self.queue.try_pop_latest()
     }
 
-    pub fn format(&self) -> Option<AudioFormat> {
-        self.format.get().copied()
-    }
-
-    pub fn queue(&self) -> AudioQueue {
-        self.queue.clone()
+    pub fn queue(&self) -> &AudioQueue {
+        &self.queue
     }
 }
 
@@ -66,18 +58,15 @@ impl LoopbackCapture {
     pub fn start_default_loopback(config: LoopbackCaptureConfig) -> anyhow::Result<Self> {
         let queue = AudioQueue::new(config.queue_capacity);
         let stop = Arc::new(AtomicBool::new(false));
-        let format = Arc::new(OnceLock::new());
         let queue_ = queue.clone();
         let stop_ = stop.clone();
-        let format_ = format.clone();
         let join = std::thread::spawn(move || {
-            if let Err(err) = capture_thread(config, queue_, stop_, format_) {
+            if let Err(err) = capture_thread(config, queue_, stop_) {
                 tracing::error!(error = %err, "loopback capture thread exited with error");
             }
         });
         Ok(Self {
             queue,
-            format,
             stop,
             join: Some(join),
         })
@@ -86,20 +75,7 @@ impl LoopbackCapture {
     pub fn stream(&self) -> AudioStream {
         AudioStream {
             queue: self.queue.clone(),
-            format: self.format.clone(),
         }
-    }
-
-    pub fn queue(&self) -> AudioQueue {
-        self.queue.clone()
-    }
-
-    pub fn format(&self) -> Option<AudioFormat> {
-        self.format.get().copied()
-    }
-
-    pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -125,11 +101,12 @@ fn capture_thread(
     config: LoopbackCaptureConfig,
     queue: AudioQueue,
     stop: Arc<AtomicBool>,
-    format_lock: Arc<OnceLock<AudioFormat>>,
 ) -> anyhow::Result<()> {
-    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
-    let result = capture_thread_inner(config, queue, stop, format_lock);
-    unsafe { CoUninitialize() };
+    let com_initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
+    let result = capture_thread_inner(config, queue, stop);
+    if com_initialized {
+        unsafe { CoUninitialize() };
+    }
     result
 }
 
@@ -137,7 +114,6 @@ fn capture_thread_inner(
     config: LoopbackCaptureConfig,
     queue: AudioQueue,
     stop: Arc<AtomicBool>,
-    format_lock: Arc<OnceLock<AudioFormat>>,
 ) -> anyhow::Result<()> {
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
@@ -146,7 +122,6 @@ fn capture_thread_inner(
     let pwfx = unsafe { audio_client.GetMixFormat()? };
     anyhow::ensure!(!pwfx.is_null(), "GetMixFormat returned null");
     let (format, encoding, block_align_bytes) = unsafe { parse_format(pwfx)? };
-    let _ = format_lock.set(format);
     let hns_buffer_duration: i64 = 10_000_000 / 10;
     unsafe {
         audio_client.Initialize(
@@ -161,29 +136,23 @@ fn capture_thread_inner(
     unsafe { CoTaskMemFree(Some(pwfx as _)) };
     let capture_client: IAudioCaptureClient = unsafe { audio_client.GetService()? };
     unsafe { audio_client.Start()? };
-    let started_at = Instant::now();
     let mut last_fill = Instant::now();
-    let mut last_energy = AudioEnergy::default();
     let mut accum: Vec<f32> = Vec::with_capacity(config.block_frames * format.channels as usize);
     while !stop.load(Ordering::Relaxed) {
         let mut packet_frames = unsafe { capture_client.GetNextPacketSize()? };
         if packet_frames == 0 {
             let now = Instant::now();
             if now.duration_since(last_fill) >= config.no_data_fill_interval {
-                last_energy = decay_energy(last_energy, now.duration_since(last_fill), config.smooth_tau);
                 let samples_len = config.block_frames * format.channels as usize;
                 let samples = vec![0.0; samples_len];
-                let timestamp_qpc = started_at.elapsed().as_nanos() as i64;
                 queue.push(AudioBlock {
                     format,
                     samples,
                     frames: config.block_frames,
-                    energy: last_energy,
-                    timestamp_qpc,
                 });
                 last_fill = now;
             } else {
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(Duration::from_millis(1));
             }
             continue;
         }
@@ -211,15 +180,10 @@ fn capture_thread_inner(
             while accum.len() >= config.block_frames * format.channels as usize {
                 let take = config.block_frames * format.channels as usize;
                 let block_samples = accum.drain(0..take).collect::<Vec<_>>();
-                let energy = compute_energy(&block_samples);
-                last_energy = energy;
-                let timestamp_qpc = started_at.elapsed().as_nanos() as i64;
                 queue.push(AudioBlock {
                     format,
                     samples: block_samples,
                     frames: config.block_frames,
-                    energy,
-                    timestamp_qpc,
                 });
                 last_fill = Instant::now();
             }
@@ -345,39 +309,4 @@ unsafe fn decode_pcm24_in32(data_ptr: *const u8, sample_count: usize, valid_bits
         .collect()
 }
 
-fn compute_energy(samples: &[f32]) -> AudioEnergy {
-    if samples.is_empty() {
-        return AudioEnergy::default();
-    }
-    let mut sum_sq = 0.0f64;
-    let mut peak = 0.0f32;
-    for &s in samples {
-        let a = s.abs();
-        if a > peak {
-            peak = a;
-        }
-        sum_sq += (s as f64) * (s as f64);
-    }
-    let mean_sq = sum_sq / samples.len() as f64;
-    AudioEnergy {
-        rms: (mean_sq.sqrt() as f32).min(1.0),
-        peak: peak.min(1.0),
-    }
-}
 
-fn decay_energy(mut energy: AudioEnergy, dt: Duration, tau: Duration) -> AudioEnergy {
-    if energy.rms == 0.0 && energy.peak == 0.0 {
-        return energy;
-    }
-    let tau_s = tau.as_secs_f32().max(0.001);
-    let k = (-dt.as_secs_f32() / tau_s).exp();
-    energy.rms *= k;
-    energy.peak *= k;
-    if energy.rms < 1e-5 {
-        energy.rms = 0.0;
-    }
-    if energy.peak < 1e-5 {
-        energy.peak = 0.0;
-    }
-    energy
-}

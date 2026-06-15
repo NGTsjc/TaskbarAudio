@@ -10,21 +10,25 @@ pub struct LoggingGuard {
 }
 
 pub fn init() -> anyhow::Result<LoggingGuard> {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
-    let log_file_enabled = std::env::var("TASKBARAUDIO_LOG_FILE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if log_file_enabled {
+    let log_level = std::env::var("TASKBARAUDIO_LOG_LEVEL").unwrap_or_else(|_| "debug".to_string());
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(&log_level)
+    });
+
+    let file_enabled = std::env::var("TASKBARAUDIO_LOG_FILE").is_ok();
+    if file_enabled {
         if let Ok(guard) = init_file_logger(env_filter.clone()) {
             return Ok(guard);
         }
     }
+
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .try_init()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
     Ok(LoggingGuard { _file: None })
 }
 
@@ -41,7 +45,7 @@ pub fn install_panic_hook() {
             .location()
             .map(|l| format!("{}:{}", l.file(), l.line()))
             .unwrap_or_else(|| "unknown".to_string());
-        tracing::error!(panic = %payload, location = %location, "panic");
+        tracing::error!(panic = %payload, location = %location, "panic occurred");
     }));
 }
 
@@ -84,18 +88,62 @@ fn default_log_dir() -> PathBuf {
 fn init_file_logger(env_filter: EnvFilter) -> anyhow::Result<LoggingGuard> {
     let log_dir = default_log_dir();
     std::fs::create_dir_all(&log_dir)?;
+    
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let log_file_path = log_dir.join(format!("taskbar_audio_{}.log", timestamp));
+    
     let mut log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_dir.join("taskbar_audio.log"))?;
+        .open(log_file_path)?;
+    
     writeln!(&mut log_file)?;
     let file = Arc::new(Mutex::new(log_file));
     let make_writer = FileMakeWriter { file: Arc::clone(&file) };
+    
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_writer(make_writer)
         .with_ansi(false)
         .try_init()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    
     Ok(LoggingGuard { _file: Some(file) })
+}
+
+pub mod macros {
+    #[macro_export]
+    macro_rules! trace {
+        ($($arg:tt)*) => {
+            tracing::trace!($($arg)*)
+        };
+    }
+
+    #[macro_export]
+    macro_rules! debug {
+        ($($arg:tt)*) => {
+            tracing::debug!($($arg)*)
+        };
+    }
+
+    #[macro_export]
+    macro_rules! info {
+        ($($arg:tt)*) => {
+            tracing::info!($($arg)*)
+        };
+    }
+
+    #[macro_export]
+    macro_rules! warn {
+        ($($arg:tt)*) => {
+            tracing::warn!($($arg)*)
+        };
+    }
+
+    #[macro_export]
+    macro_rules! error {
+        ($($arg:tt)*) => {
+            tracing::error!($($arg)*)
+        };
+    }
 }
