@@ -1,55 +1,45 @@
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use crossbeam_queue::ArrayQueue;
+use std::sync::Arc;
 use crate::audio::types::AudioBlock;
 
-#[derive(Clone)]
 pub struct AudioQueue {
-    inner: Arc<Mutex<VecDeque<AudioBlock>>>,
-    capacity: usize,
+    inner: Arc<ArrayQueue<AudioBlock>>,
+}
+
+impl Clone for AudioQueue {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl AudioQueue {
     pub fn new(capacity: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(VecDeque::with_capacity(capacity))),
-            capacity,
+            inner: Arc::new(ArrayQueue::new(capacity)),
         }
     }
 
     pub fn push(&self, block: AudioBlock) {
-        let mut q = self.inner.lock().unwrap();
-        while q.len() >= self.capacity {
-            let _ = q.pop_front();
+        while self.inner.push(block.clone()).is_err() {
+            let _ = self.inner.pop();
         }
-        q.push_back(block);
     }
 
     pub fn pop_latest(&self) -> Option<AudioBlock> {
-        let mut q = self.inner.lock().unwrap();
-        if q.is_empty() {
-            return None;
+        let mut last = None;
+        while let Some(block) = self.inner.pop() {
+            last = Some(block);
         }
-        let latest = q.pop_back();
-        q.clear();
-        latest
-    }
-
-    pub fn try_pop_latest(&self) -> Option<AudioBlock> {
-        let lock = self.inner.try_lock();
-        if lock.is_err() {
-            return None;
-        }
-        let mut q = lock.unwrap();
-        if q.is_empty() {
-            return None;
-        }
-        let latest = q.pop_back();
-        q.clear();
-        latest
+        last
     }
 
     pub fn len(&self) -> usize {
-        let q = self.inner.lock().unwrap();
-        q.len()
+        self.inner.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
     }
 }

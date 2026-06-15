@@ -11,6 +11,7 @@ mod win32;
 use crate::single_instance::SingleInstanceGuard;
 use crate::win32::message_loop::MessageLoop;
 use crate::audio::{LoopbackCapture, LoopbackCaptureConfig};
+use crate::util::mmsystem::HighResTimerGuard;
 
 fn main() {
     if let Err(err) = run() {
@@ -20,6 +21,7 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
+    let _timer_guard = HighResTimerGuard::new(1);
     let _logging_guard = logging::init()?;
     logging::install_panic_hook();
     config::user::load_user_config()?;

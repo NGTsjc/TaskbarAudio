@@ -341,15 +341,11 @@ impl TaskbarEmbedController {
     }
 
     fn watchdog_tick(&mut self, message_hwnd: HWND) {
-        tracing::debug!("watchdog_tick triggered, tray_only={}, panel_hwnd={:p}", self.tray_only, self.panel_hwnd.0);
-
         let Ok(shell) = (unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }) else {
-            tracing::debug!("watchdog: FindWindowW failed");
             if !self.tray_only {
                 tracing::warn!("watchdog: taskbar window disappeared, switching to tray-only");
                 self.set_tray_only();
                 unsafe {
-                    tracing::debug!("watchdog: starting RETRY_TIMER");
                     SetTimer(
                         message_hwnd,
                         RETRY_TIMER_ID,
@@ -361,15 +357,11 @@ impl TaskbarEmbedController {
             return;
         };
 
-        tracing::debug!("watchdog: found shell window={:p}", shell.0);
-
         if shell.0 == std::ptr::null_mut() {
-            tracing::debug!("watchdog: shell window is null");
             if !self.tray_only {
                 tracing::warn!("watchdog: taskbar window is null, switching to tray-only");
                 self.set_tray_only();
                 unsafe {
-                    tracing::debug!("watchdog: starting RETRY_TIMER");
                     SetTimer(
                         message_hwnd,
                         RETRY_TIMER_ID,
@@ -381,18 +373,11 @@ impl TaskbarEmbedController {
             return;
         }
 
-        match is_bottom_taskbar(shell) {
-            Ok(true) => tracing::debug!("watchdog: is_bottom_taskbar=true"),
-            Ok(false) => tracing::debug!("watchdog: is_bottom_taskbar=false"),
-            Err(e) => tracing::debug!("watchdog: is_bottom_taskbar error={}", e),
-        }
-
         let Ok(true) = is_bottom_taskbar(shell) else {
             if !self.tray_only {
                 tracing::warn!("watchdog: bottom taskbar not found, switching to tray-only");
                 self.set_tray_only();
                 unsafe {
-                    tracing::debug!("watchdog: starting RETRY_TIMER");
                     SetTimer(
                         message_hwnd,
                         RETRY_TIMER_ID,
@@ -406,25 +391,21 @@ impl TaskbarEmbedController {
 
         unsafe {
             let parent = GetParent(self.panel_hwnd).unwrap_or(HWND(std::ptr::null_mut()));
-            tracing::debug!("watchdog: panel parent={:p}, shell={:p}", parent.0, shell.0);
-
-            // 使用更可靠的方法检查父窗口是否是有效的任务栏窗口
             let parent_is_valid_shell = is_valid_shell_tray_wnd(parent);
-            tracing::debug!("watchdog: parent_is_valid_shell_tray={}", parent_is_valid_shell);
 
             if !parent_is_valid_shell || parent.0 != shell.0 {
                 if !parent_is_valid_shell {
-                    tracing::info!("watchdog: parent is not a valid Shell_TrayWnd (destroyed or reused), attempting reattach");
+                    tracing::info!("watchdog: parent is not a valid Shell_TrayWnd, attempting reattach");
                 } else {
                     tracing::info!("watchdog: parent mismatch detected, attempting reattach");
                 }
                 match self.try_attach() {
                     Ok(true) => {
-                        tracing::info!("watchdog: successfully reattached to taskbar after restart");
+                        tracing::info!("watchdog: successfully reattached to taskbar");
                         self.watchdog_recover_count = self.watchdog_recover_count.saturating_add(1);
                     }
                     Ok(false) => {
-                        tracing::warn!("watchdog: try_attach returned false, switching to tray-only");
+                        tracing::warn!("watchdog: try_attach failed, switching to tray-only");
                         self.set_tray_only();
                         SetTimer(
                             message_hwnd,
@@ -446,8 +427,6 @@ impl TaskbarEmbedController {
                         return;
                     }
                 }
-            } else {
-                tracing::debug!("watchdog: parent matches and is valid, no reattach needed");
             }
         }
         let mut client = RECT::default();
@@ -647,11 +626,15 @@ extern "system" fn panel_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _hdc = BeginPaint(hwnd, &mut ps);
             if let Some(state) = get_panel_state_mut(hwnd) {
                 let start = Instant::now();
-                if let Err(err) = state.renderer.render(hwnd) {
-                    tracing::debug!(error = %err, "panel render failed");
-                } else {
-                    state.stats.frames = state.stats.frames.saturating_add(1);
-                    state.stats.render_time_accum += start.elapsed();
+                match state.renderer.render(hwnd) {
+                    Ok(true) => {
+                        state.stats.frames = state.stats.frames.saturating_add(1);
+                        state.stats.render_time_accum += start.elapsed();
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::debug!(error = %err, "panel render failed");
+                    }
                 }
                 if state.stats.last_log.elapsed() >= Duration::from_secs(10) {
                     let frames = state.stats.frames.max(1);

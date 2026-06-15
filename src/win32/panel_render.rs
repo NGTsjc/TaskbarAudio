@@ -84,11 +84,17 @@ impl PanelRenderer {
         Ok(())
     }
 
-    pub fn render(&mut self, hwnd: HWND) -> anyhow::Result<()> {
+    pub fn render(&mut self, hwnd: HWND) -> anyhow::Result<bool> {
         self.ensure_device_resources(hwnd)?;
         self.poll_spectrum();
+        
+        let Some(rt) = self.target.clone() else { return Ok(false) };
+        
+        if self.last_energy < 1e-5 {
+            return self.clear_canvas(rt);
+        }
+        
         self.step_animation();
-        let Some(rt) = self.target.clone() else { return Ok(()) };
         let client_size = client_size_u(hwnd)?;
         unsafe {
             rt.BeginDraw();
@@ -100,11 +106,30 @@ impl PanelRenderer {
                 _ => self.draw_bars(&rt, client_size),
             }
             match rt.EndDraw(None, None) {
-                Ok(_) => Ok(()),
+                Ok(_) => Ok(true),
                 Err(err) => {
                     if err.code().0 == 0x8899000C_u32 as i32 {
                         self.drop_device_resources();
-                        Ok(())
+                        Ok(false)
+                    } else {
+                        Err(err.into())
+                    }
+                }
+            }
+        }
+    }
+    
+    fn clear_canvas(&mut self, rt: ID2D1RenderTarget) -> anyhow::Result<bool> {
+        unsafe {
+            rt.BeginDraw();
+            rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+            rt.Clear(Some(&color_rgba(1.0, 0.0, 1.0, 1.0)));
+            match rt.EndDraw(None, None) {
+                Ok(_) => Ok(true),
+                Err(err) => {
+                    if err.code().0 == 0x8899000C_u32 as i32 {
+                        self.drop_device_resources();
+                        Ok(false)
                     } else {
                         Err(err.into())
                     }

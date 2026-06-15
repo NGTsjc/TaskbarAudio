@@ -6,7 +6,7 @@ pub struct UiConfigConst;
 impl UiConfigConst {
     pub const PANEL_WIDTH_PX: i32 = 240;
     pub const COLORKEY_FUCHSIA_RGB: u32 = 0x00FF00FF;
-    pub const WATCHDOG_INTERVAL_MS: u32 = 1000;
+    pub const WATCHDOG_INTERVAL_MS: u32 = 3000;
     pub const RETRY_ATTACH_INTERVAL_MS: u32 = 3000;
     pub const RENDER_ACTIVE_INTERVAL_MS: u32 = 16;
     pub const RENDER_IDLE_INTERVAL_MS: u32 = 120;
