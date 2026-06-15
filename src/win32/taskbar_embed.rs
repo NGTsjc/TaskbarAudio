@@ -14,8 +14,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, GetClientRect, GetWindowLongPtrW,
-    GetParent, IsWindowVisible, KillTimer, PostMessageW, RegisterClassW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, GetClassNameW, GetClientRect, GetWindowLongPtrW,
+    GetParent, IsWindow, IsWindowVisible, KillTimer, PostMessageW, RegisterClassW,
     SetLayeredWindowAttributes, SetParent, SetTimer, SendMessageW, SetWindowLongPtrW,
     ShowWindow,
     CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, HMENU, HTTRANSPARENT,
@@ -31,6 +31,24 @@ const RETRY_TIMER_ID: usize = 1;
 const RENDER_TIMER_ID: usize = 2;
 const WATCHDOG_TIMER_ID: usize = 3;
 pub const WM_APP_RETRY_ATTACH: u32 = WM_APP + 1;
+
+/// 检查窗口是否是有效的 Shell_TrayWnd（任务栏窗口）
+fn is_valid_shell_tray_wnd(hwnd: HWND) -> bool {
+    if hwnd.0.is_null() {
+        return false;
+    }
+    if !unsafe { IsWindow(hwnd) }.as_bool() {
+        return false;
+    }
+    // 检查窗口类名是否是 Shell_TrayWnd
+    let mut class_name = [0u16; 256];
+    let len = unsafe { GetClassNameW(hwnd, &mut class_name) };
+    if len <= 0 {
+        return false;
+    }
+    let name = String::from_utf16_lossy(&class_name[..len as usize]);
+    name == "Shell_TrayWnd"
+}
 
 pub fn init(message_hwnd: HWND) -> anyhow::Result<()> {
     unsafe {
@@ -126,20 +144,25 @@ pub fn request_retry_attach(message_hwnd: HWND) {
 }
 
 fn attempt_attach(message_hwnd: HWND) -> bool {
+    tracing::debug!("attempt_attach called");
     let controller = unsafe { get_controller_mut(message_hwnd) };
-    let Some(controller) = controller else { return false };
+    let Some(controller) = controller else {
+        tracing::debug!("attempt_attach: controller is None");
+        return false;
+    };
+    tracing::debug!("attempt_attach: controller found, calling try_attach");
     match controller.try_attach() {
         Ok(true) => {
-            tracing::info!("taskbar embed attached");
+            tracing::info!("attempt_attach: taskbar embed attached successfully");
             true
         }
         Ok(false) => {
-            tracing::warn!("taskbar embed unavailable, fallback to tray-only; will retry");
+            tracing::warn!("attempt_attach: taskbar embed unavailable, fallback to tray-only; will retry");
             controller.set_tray_only();
             false
         }
         Err(err) => {
-            tracing::warn!(error = %err, "taskbar embed failed, fallback to tray-only; will retry");
+            tracing::warn!(error = %err, "attempt_attach: taskbar embed failed, fallback to tray-only; will retry");
             controller.set_tray_only();
             false
         }
@@ -195,6 +218,21 @@ impl PanelRuntimeStats {
 
 impl TaskbarEmbedController {
     fn new() -> anyhow::Result<Self> {
+        let panel_hwnd = Self::create_panel_window()?;
+        Ok(Self {
+            panel_hwnd,
+            tray_only: true,
+            last_layout: None,
+            watchdog_recover_count: 0,
+            layout_update_count: 0,
+            pending_show: false,
+            pending_since: Instant::now(),
+            stable_client_ticks: 0,
+            last_shell_client: None,
+        })
+    }
+
+    fn create_panel_window() -> anyhow::Result<HWND> {
         unsafe {
             let instance = GetModuleHandleW(None)?;
             let class_name = w!("TaskbarAudioPanel");
@@ -231,65 +269,191 @@ impl TaskbarEmbedController {
                 LWA_COLORKEY,
             );
             let _ = ShowWindow(panel_hwnd, SW_HIDE);
-            Ok(Self {
-                panel_hwnd,
-                tray_only: true,
-                last_layout: None,
-                watchdog_recover_count: 0,
-                layout_update_count: 0,
-                pending_show: false,
-                pending_since: Instant::now(),
-                stable_client_ticks: 0,
-                last_shell_client: None,
-            })
+            Ok(panel_hwnd)
+        }
+    }
+
+    fn recreate_panel_window(&mut self) -> anyhow::Result<()> {
+        unsafe {
+            if self.panel_hwnd.0 != std::ptr::null_mut() {
+                let _ = DestroyWindow(self.panel_hwnd);
+            }
+            self.panel_hwnd = Self::create_panel_window()?;
+            tracing::info!("recreated panel window: {:p}", self.panel_hwnd.0);
+            self.last_layout = None;
+            Ok(())
         }
     }
 
     fn try_attach(&mut self) -> anyhow::Result<bool> {
+        tracing::debug!("try_attach called, panel_hwnd={:p}", self.panel_hwnd.0);
         unsafe {
             if std::env::var_os("TASKBARAUDIO_DISABLE_EMBED").is_some() {
+                tracing::debug!("try_attach: TASKBARAUDIO_DISABLE_EMBED set, returning false");
                 return Ok(false);
             }
             let shell = match FindWindowW(w!("Shell_TrayWnd"), None) {
                 Ok(h) => h,
-                Err(_) => return Ok(false),
+                Err(e) => {
+                    tracing::debug!("try_attach: FindWindowW failed: {}", e);
+                    return Ok(false);
+                }
             };
             if shell.0 == std::ptr::null_mut() {
+                tracing::debug!("try_attach: shell window is null");
                 return Ok(false);
             }
+            tracing::debug!("try_attach: found shell window={:p}", shell.0);
+
+            match is_bottom_taskbar(shell) {
+                Ok(true) => tracing::debug!("try_attach: is_bottom_taskbar=true"),
+                Ok(false) => tracing::debug!("try_attach: is_bottom_taskbar=false"),
+                Err(e) => tracing::debug!("try_attach: is_bottom_taskbar error={}", e),
+            }
+
             if !is_bottom_taskbar(shell)? {
+                tracing::debug!("try_attach: not a bottom taskbar");
                 return Ok(false);
             }
+
             let shell_rect = get_window_rect(shell)?;
             let taskbar_height = shell_rect.bottom - shell_rect.top;
+            tracing::debug!("try_attach: taskbar_height={}", taskbar_height);
+
             if taskbar_height <= 0 {
+                tracing::debug!("try_attach: taskbar_height <= 0");
                 return Ok(false);
             }
-            self.attach_to_shell(shell)?;
+
+            tracing::debug!("try_attach: calling attach_to_shell");
+            let mut recreated = false;
+            match self.attach_to_shell(shell) {
+                Ok(()) => {
+                    tracing::debug!("try_attach: attach_to_shell succeeded");
+                }
+                Err(e) => {
+                    tracing::warn!("try_attach: attach_to_shell failed: {}, attempting to recreate panel window", e);
+                    self.recreate_panel_window()?;
+                    self.attach_to_shell(shell)?;
+                    recreated = true;
+                    tracing::debug!("try_attach: attach_to_shell succeeded after panel recreation");
+                }
+            }
+
             self.tray_only = false;
-            self.pending_show = true;
+            self.pending_show = false;
             self.pending_since = Instant::now();
             self.stable_client_ticks = 0;
             self.last_shell_client = None;
+            
+            if recreated {
+                tracing::debug!("try_attach: showing panel window immediately after recreation");
+                let _ = ShowWindow(self.panel_hwnd, SW_SHOWNOACTIVATE);
+            } else {
+                self.pending_show = true;
+            }
+            
+            tracing::debug!("try_attach: returning true, pending_show={}", self.pending_show);
             Ok(true)
         }
     }
 
     fn watchdog_tick(&mut self, message_hwnd: HWND) {
-        if self.tray_only {
+        tracing::debug!("watchdog_tick triggered, tray_only={}, panel_hwnd={:p}", self.tray_only, self.panel_hwnd.0);
+
+        let Ok(shell) = (unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }) else {
+            tracing::debug!("watchdog: FindWindowW failed");
+            if !self.tray_only {
+                tracing::warn!("watchdog: taskbar window disappeared, switching to tray-only");
+                self.set_tray_only();
+                unsafe {
+                    tracing::debug!("watchdog: starting RETRY_TIMER");
+                    SetTimer(
+                        message_hwnd,
+                        RETRY_TIMER_ID,
+                        UiConfig::RETRY_ATTACH_INTERVAL_MS,
+                        None as TIMERPROC,
+                    );
+                }
+            }
             return;
-        }
-        let Ok(shell) = (unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }) else { return };
+        };
+
+        tracing::debug!("watchdog: found shell window={:p}", shell.0);
+
         if shell.0 == std::ptr::null_mut() {
+            tracing::debug!("watchdog: shell window is null");
+            if !self.tray_only {
+                tracing::warn!("watchdog: taskbar window is null, switching to tray-only");
+                self.set_tray_only();
+                unsafe {
+                    tracing::debug!("watchdog: starting RETRY_TIMER");
+                    SetTimer(
+                        message_hwnd,
+                        RETRY_TIMER_ID,
+                        UiConfig::RETRY_ATTACH_INTERVAL_MS,
+                        None as TIMERPROC,
+                    );
+                }
+            }
             return;
         }
-        let Ok(true) = is_bottom_taskbar(shell) else { return };
+
+        match is_bottom_taskbar(shell) {
+            Ok(true) => tracing::debug!("watchdog: is_bottom_taskbar=true"),
+            Ok(false) => tracing::debug!("watchdog: is_bottom_taskbar=false"),
+            Err(e) => tracing::debug!("watchdog: is_bottom_taskbar error={}", e),
+        }
+
+        let Ok(true) = is_bottom_taskbar(shell) else {
+            if !self.tray_only {
+                tracing::warn!("watchdog: bottom taskbar not found, switching to tray-only");
+                self.set_tray_only();
+                unsafe {
+                    tracing::debug!("watchdog: starting RETRY_TIMER");
+                    SetTimer(
+                        message_hwnd,
+                        RETRY_TIMER_ID,
+                        UiConfig::RETRY_ATTACH_INTERVAL_MS,
+                        None as TIMERPROC,
+                    );
+                }
+            }
+            return;
+        };
+
         unsafe {
             let parent = GetParent(self.panel_hwnd).unwrap_or(HWND(std::ptr::null_mut()));
-            if parent.0 != shell.0 {
+            tracing::debug!("watchdog: panel parent={:p}, shell={:p}", parent.0, shell.0);
+
+            // 使用更可靠的方法检查父窗口是否是有效的任务栏窗口
+            let parent_is_valid_shell = is_valid_shell_tray_wnd(parent);
+            tracing::debug!("watchdog: parent_is_valid_shell_tray={}", parent_is_valid_shell);
+
+            if !parent_is_valid_shell || parent.0 != shell.0 {
+                if !parent_is_valid_shell {
+                    tracing::info!("watchdog: parent is not a valid Shell_TrayWnd (destroyed or reused), attempting reattach");
+                } else {
+                    tracing::info!("watchdog: parent mismatch detected, attempting reattach");
+                }
                 match self.try_attach() {
-                    Ok(true) => self.watchdog_recover_count = self.watchdog_recover_count.saturating_add(1),
-                    _ => {
+                    Ok(true) => {
+                        tracing::info!("watchdog: successfully reattached to taskbar after restart");
+                        self.watchdog_recover_count = self.watchdog_recover_count.saturating_add(1);
+                    }
+                    Ok(false) => {
+                        tracing::warn!("watchdog: try_attach returned false, switching to tray-only");
+                        self.set_tray_only();
+                        SetTimer(
+                            message_hwnd,
+                            RETRY_TIMER_ID,
+                            UiConfig::RETRY_ATTACH_INTERVAL_MS,
+                            None as TIMERPROC,
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("watchdog: try_attach error={}, switching to tray-only", e);
                         self.set_tray_only();
                         SetTimer(
                             message_hwnd,
@@ -300,6 +464,8 @@ impl TaskbarEmbedController {
                         return;
                     }
                 }
+            } else {
+                tracing::debug!("watchdog: parent matches and is valid, no reattach needed");
             }
         }
         let mut client = RECT::default();
@@ -318,9 +484,6 @@ impl TaskbarEmbedController {
                 self.pending_since = Instant::now();
                 self.stable_client_ticks = 0;
                 self.last_shell_client = None;
-                if IsWindowVisible(self.panel_hwnd).as_bool() {
-                    let _ = ShowWindow(self.panel_hwnd, SW_HIDE);
-                }
                 return;
             }
 

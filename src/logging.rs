@@ -10,7 +10,7 @@ pub struct LoggingGuard {
 }
 
 pub fn init() -> anyhow::Result<LoggingGuard> {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
     let log_file_enabled = std::env::var("TASKBARAUDIO_LOG_FILE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
