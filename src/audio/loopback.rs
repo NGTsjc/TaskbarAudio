@@ -7,7 +7,7 @@ use windows::Win32::Media::Audio::{
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
     WAVE_FORMAT_PCM,
 };
-use windows::Win32::Media::Audio::{eConsole, eRender, MMDeviceEnumerator};
+use windows::Win32::Media::Audio::{eCapture, eConsole, eRender, MMDeviceEnumerator};
 use windows::Win32::Media::KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM;
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 use windows::Win32::System::Com::{
@@ -21,6 +21,7 @@ pub struct LoopbackCaptureConfig {
     pub block_frames: usize,
     pub queue_capacity: usize,
     pub no_data_fill_interval: Duration,
+    pub environment_volume: bool,
 }
 
 impl Default for LoopbackCaptureConfig {
@@ -29,6 +30,7 @@ impl Default for LoopbackCaptureConfig {
             block_frames: 512,
             queue_capacity: 4,
             no_data_fill_interval: Duration::from_millis(10),
+            environment_volume: false,
         }
     }
 }
@@ -73,7 +75,7 @@ impl LoopbackCapture {
         let stop_clone2 = stop.clone();
         let restart_clone2 = restart.clone();
         let notification_join = std::thread::spawn(move || {
-            Self::poll_device_change(restart_clone2, stop_clone2);
+            Self::poll_device_change(restart_clone2, stop_clone2, config.environment_volume);
         });
         
         Ok(Self {
@@ -88,12 +90,13 @@ impl LoopbackCapture {
     fn poll_device_change(
         restart: Arc<AtomicBool>,
         stop: Arc<AtomicBool>,
+        environment_volume: bool,
     ) {
         let com_initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
         let mut last_device_id = String::new();
         
         while !stop.load(Ordering::Relaxed) {
-            let device_id = match Self::get_default_device_id() {
+            let device_id = match Self::get_default_device_id(environment_volume) {
                 Ok(id) => id,
                 Err(_) => {
                     std::thread::sleep(Duration::from_millis(500));
@@ -115,10 +118,11 @@ impl LoopbackCapture {
         }
     }
 
-    fn get_default_device_id() -> anyhow::Result<String> {
+    fn get_default_device_id(environment_volume: bool) -> anyhow::Result<String> {
         let enumerator: IMMDeviceEnumerator =
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
-        let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole)? };
+        let data_flow = if environment_volume { eCapture } else { eRender };
+        let device = unsafe { enumerator.GetDefaultAudioEndpoint(data_flow, eConsole)? };
         let id = unsafe { device.GetId()? };
         let id_str = unsafe { id.to_string().map_err(|e| anyhow::anyhow!("failed to convert device id: {}", e))? };
         Ok(id_str)
@@ -161,6 +165,10 @@ impl LoopbackCapture {
         stop: Arc<AtomicBool>,
         restart: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
+        if config.environment_volume {
+            return Self::capture_mixed(config, queue, stop, restart);
+        }
+        
         let enumerator: IMMDeviceEnumerator =
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
         let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole)? };
@@ -168,7 +176,7 @@ impl LoopbackCapture {
         let device_id = unsafe { device.GetId()? };
         let device_id_str = unsafe { device_id.to_string().unwrap_or_else(|_| "unknown".to_string()) };
         
-        tracing::info!(device_id = %device_id_str, "started capturing from default audio device");
+        tracing::info!(device_id = %device_id_str, mode = "system", "started capturing from default audio device");
         
         let audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
         let pwfx = unsafe { audio_client.GetMixFormat()? };
@@ -191,6 +199,188 @@ impl LoopbackCapture {
         let mut last_fill = Instant::now();
         let mut accum: Vec<f32> = Vec::with_capacity(config.block_frames * format.channels as usize);
         
+        Self::capture_loop_inner(capture_client, format, encoding, block_align_bytes, config, &mut accum, queue, stop, restart, &mut last_fill)
+    }
+
+    fn capture_mixed(
+        config: LoopbackCaptureConfig,
+        queue: AudioQueue,
+        stop: Arc<AtomicBool>,
+        restart: Arc<AtomicBool>,
+    ) -> anyhow::Result<()> {
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+        
+        let render_device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole)? };
+        let capture_device = unsafe { enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)? };
+        
+        let render_id = unsafe { render_device.GetId()? };
+        let capture_id = unsafe { capture_device.GetId()? };
+        let render_id_str = unsafe { render_id.to_string().unwrap_or_else(|_| "unknown".to_string()) };
+        let capture_id_str = unsafe { capture_id.to_string().unwrap_or_else(|_| "unknown".to_string()) };
+        
+        tracing::info!(render_device = %render_id_str, capture_device = %capture_id_str, mode = "mixed", "started capturing mixed audio");
+        
+        let render_client: IAudioClient = unsafe { render_device.Activate(CLSCTX_ALL, None)? };
+        let capture_audio_client: IAudioClient = unsafe { capture_device.Activate(CLSCTX_ALL, None)? };
+        
+        let render_pwfx = unsafe { render_client.GetMixFormat()? };
+        let capture_pwfx = unsafe { capture_audio_client.GetMixFormat()? };
+        anyhow::ensure!(!render_pwfx.is_null() && !capture_pwfx.is_null(), "GetMixFormat returned null");
+        
+        let (format, encoding, block_align_bytes) = unsafe { parse_format(render_pwfx)? };
+        let hns_buffer_duration: i64 = 10_000_000 / 10;
+        
+        unsafe {
+            render_client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK,
+                hns_buffer_duration,
+                0,
+                render_pwfx,
+                None,
+            )?;
+            capture_audio_client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                0,
+                hns_buffer_duration,
+                0,
+                capture_pwfx,
+                None,
+            )?;
+        }
+        
+        unsafe {
+            windows::Win32::System::Com::CoTaskMemFree(Some(render_pwfx as _));
+            windows::Win32::System::Com::CoTaskMemFree(Some(capture_pwfx as _));
+        }
+        
+        let render_capture_client: IAudioCaptureClient = unsafe { render_client.GetService()? };
+        let mic_capture_client: IAudioCaptureClient = unsafe { capture_audio_client.GetService()? };
+        
+        unsafe {
+            render_client.Start()?;
+            capture_audio_client.Start()?;
+        }
+        
+        let mut render_accum: Vec<f32> = Vec::with_capacity(config.block_frames * format.channels as usize);
+        let mut mic_accum: Vec<f32> = Vec::with_capacity(config.block_frames * format.channels as usize);
+        
+        while !stop.load(Ordering::Relaxed) {
+            if restart.load(Ordering::Relaxed) {
+                tracing::info!("device change detected, restarting capture");
+                break;
+            }
+            
+            let render_block = Self::get_next_audio_block(&render_capture_client, format, encoding, block_align_bytes, config.block_frames);
+            let mic_block = Self::get_next_audio_block(&mic_capture_client, format, encoding, block_align_bytes, config.block_frames);
+            
+            render_accum.extend_from_slice(&render_block);
+            mic_accum.extend_from_slice(&mic_block);
+            
+            let max_len = render_accum.len().max(mic_accum.len());
+            while render_accum.len() < max_len {
+                render_accum.push(0.0);
+            }
+            while mic_accum.len() < max_len {
+                mic_accum.push(0.0);
+            }
+            
+            let block_size = config.block_frames * format.channels as usize;
+            
+            while render_accum.len() >= block_size && mic_accum.len() >= block_size {
+                let mut mixed = Vec::with_capacity(block_size);
+                for i in 0..block_size {
+                    let combined = render_accum[i] + mic_accum[i];
+                    mixed.push(combined * 0.5);
+                }
+                render_accum.drain(0..block_size);
+                mic_accum.drain(0..block_size);
+                
+                queue.push(AudioBlock {
+                    format,
+                    samples: mixed,
+                    frames: config.block_frames,
+                });
+            }
+            
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        
+        unsafe {
+            let _ = render_client.Stop();
+            let _ = capture_audio_client.Stop();
+        }
+        
+        Ok(())
+    }
+
+    fn get_next_audio_block(
+        capture_client: &IAudioCaptureClient,
+        format: AudioFormat,
+        encoding: SampleEncoding,
+        block_align_bytes: usize,
+        block_frames: usize,
+    ) -> Vec<f32> {
+        let hr = unsafe { capture_client.GetNextPacketSize() };
+        if hr.is_err() {
+            return vec![0.0; block_frames * format.channels as usize];
+        }
+        let packet_frames = hr.unwrap();
+        if packet_frames == 0 {
+            return vec![0.0; block_frames * format.channels as usize];
+        }
+        
+        let mut packet_frames = packet_frames;
+        let mut result = Vec::new();
+        
+        while packet_frames > 0 {
+            let mut data_ptr: *mut u8 = std::ptr::null_mut();
+            let mut num_frames = 0u32;
+            let mut flags = 0u32;
+            
+            let hr = unsafe {
+                capture_client.GetBuffer(
+                    &mut data_ptr,
+                    &mut num_frames,
+                    &mut flags,
+                    None,
+                    None,
+                )
+            };
+            
+            if hr.is_err() {
+                break;
+            }
+            
+            let samples = if (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0 {
+                vec![0.0; num_frames as usize * format.channels as usize]
+            } else {
+                let bytes_len = num_frames as usize * block_align_bytes;
+                unsafe { decode_samples(data_ptr, bytes_len, format.channels, encoding) }
+            };
+            
+            unsafe { capture_client.ReleaseBuffer(num_frames) };
+            
+            result.extend_from_slice(&samples);
+            packet_frames = 0;
+        }
+        
+        result
+    }
+
+    fn capture_loop_inner(
+        capture_client: IAudioCaptureClient,
+        format: AudioFormat,
+        encoding: SampleEncoding,
+        block_align_bytes: usize,
+        config: LoopbackCaptureConfig,
+        accum: &mut Vec<f32>,
+        queue: AudioQueue,
+        stop: Arc<AtomicBool>,
+        restart: Arc<AtomicBool>,
+        last_fill: &mut Instant,
+    ) -> anyhow::Result<()> {
         while !stop.load(Ordering::Relaxed) {
             if restart.load(Ordering::Relaxed) {
                 tracing::info!("device change detected, restarting capture");
@@ -207,7 +397,7 @@ impl LoopbackCapture {
             
             if packet_frames == 0 {
                 let now = Instant::now();
-                if now.duration_since(last_fill) >= config.no_data_fill_interval {
+                if now.duration_since(*last_fill) >= config.no_data_fill_interval {
                     let samples_len = config.block_frames * format.channels as usize;
                     let samples = vec![0.0; samples_len];
                     queue.push(AudioBlock {
@@ -215,7 +405,7 @@ impl LoopbackCapture {
                         samples,
                         frames: config.block_frames,
                     });
-                    last_fill = now;
+                    *last_fill = now;
                 } else {
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -270,7 +460,7 @@ impl LoopbackCapture {
                         samples: block_samples,
                         frames: config.block_frames,
                     });
-                    last_fill = Instant::now();
+                    *last_fill = Instant::now();
                 }
                 
                 let hr = unsafe { capture_client.GetNextPacketSize() };
@@ -284,10 +474,6 @@ impl LoopbackCapture {
             if restart.load(Ordering::Relaxed) {
                 break;
             }
-        }
-        
-        unsafe {
-            let _ = audio_client.Stop();
         }
         
         Ok(())

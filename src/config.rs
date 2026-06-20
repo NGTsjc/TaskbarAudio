@@ -94,6 +94,7 @@ pub struct UserConfig {
     pub position: String,
     pub display_mode: String,
     pub offset_x: i32,
+    pub environment_volume: bool,
 }
 
 impl Default for UserConfig {
@@ -102,6 +103,7 @@ impl Default for UserConfig {
             position: "center".to_string(),
             display_mode: "bar".to_string(),
             offset_x: 0,
+            environment_volume: false,
         }
     }
 }

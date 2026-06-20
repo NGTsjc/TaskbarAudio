@@ -25,8 +25,12 @@ fn run() -> anyhow::Result<()> {
     let _logging_guard = logging::init()?;
     logging::install_panic_hook();
     config::user::load_user_config()?;
+    let user_config = config::user::get_user_config();
     let _instance = SingleInstanceGuard::acquire("Local\\TaskbarAudio_SingleInstance")?;
-    let loopback = LoopbackCapture::start_default_loopback(LoopbackCaptureConfig::default())?;
+    let loopback = LoopbackCapture::start_default_loopback(LoopbackCaptureConfig {
+        environment_volume: user_config.environment_volume,
+        ..Default::default()
+    })?;
     let _ = audio::set_global_stream(loopback.stream());
     let _loopback = loopback;
     let loop_ = MessageLoop::new()?;
