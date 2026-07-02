@@ -20,6 +20,15 @@ jobs:
           toolchain: stable
           targets: x86_64-pc-windows-msvc
 
+      - name: Sync Cargo Version From Tag
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".Replace('v', '')
+          $content = Get-Content Cargo.toml -Raw
+          $content = $content -replace 'version = ".*?"', "version = `"$version`""
+          Set-Content Cargo.toml $content -Encoding UTF8
+          Write-Host "Cargo.toml version synced to $version"
+
       - name: Build
         run: cargo build --release
 
@@ -45,5 +54,6 @@ jobs:
       - name: Create GitHub Release
         uses: ncipollo/release-action@v1
         with:
+          name: TaskbarAudio ${{ github.ref_name }}
           artifacts: "taskbar_audio_*.zip"
           token: ${{ secrets.GITHUB_TOKEN }}

@@ -30,7 +30,8 @@ Create a `config.json` file in the same directory as the executable:
     "position": "center",
     "display_mode": "bar",
     "offset_x": 0,
-    "environment_volume": false
+    "environment_volume": false,
+    "auto_start": false
 }
 ```
 
@@ -40,12 +41,8 @@ Create a `config.json` file in the same directory as the executable:
 - `display_mode`: `bar`, `line`
 - `offset_x`: Horizontal offset in pixels (positive = right, negative = left)
 - `environment_volume`: Enable mixed audio capture (system + microphone)
+- `auto_start`: Enable Windows auto start via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 
-## Auto Start
-
-1. Press `Win + R`
-2. Enter: `shell:startup`
-3. Create a shortcut to `taskbar_audio.exe` and place it in the startup folder
 
 ## License
 
