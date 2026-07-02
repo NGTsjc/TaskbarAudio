@@ -25,7 +25,7 @@ jobs:
         run: |
           $version = "${{ github.ref_name }}".Replace('v', '')
           $content = Get-Content Cargo.toml -Raw
-          $content = $content -replace 'version = ".*?"', "version = `"$version`""
+          $content = $content -replace '(?m)^version\s*=\s*".*?"\s*$', "version = `"$version`""
           Set-Content Cargo.toml $content -Encoding UTF8
           Write-Host "Cargo.toml version synced to $version"
 
