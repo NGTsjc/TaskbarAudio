@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use crate::config::UiConfig;
 use crate::win32::{taskbar_embed, tray};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
@@ -9,11 +10,14 @@ use windows::Win32::System::Console::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     PostMessageW, PostQuitMessage, RegisterClassW, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    HMENU, HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WNDCLASSW,
+    HMENU, HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WNDCLASSW,
 };
 use windows::core::w;
 
 static EXIT_HWND_ADDR: OnceLock<isize> = OnceLock::new();
+static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+pub const WM_APP_RESTART: u32 = WM_APP + 10;
 
 pub struct MessageLoop {
     hwnd: HWND,
@@ -21,6 +25,7 @@ pub struct MessageLoop {
 
 impl MessageLoop {
     pub fn new() -> anyhow::Result<Self> {
+        RESTART_REQUESTED.store(false, Ordering::Relaxed);
         unsafe {
             let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?;
             let class_name = w!("TaskbarAudioHiddenWindow");
@@ -79,6 +84,10 @@ impl MessageLoop {
     }
 }
 
+pub fn take_restart_requested() -> bool {
+    RESTART_REQUESTED.swap(false, Ordering::Relaxed)
+}
+
 impl Drop for MessageLoop {
     fn drop(&mut self) {
         if self.hwnd.0 != std::ptr::null_mut() {
@@ -95,6 +104,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         return result;
     }
     match msg {
+        WM_APP_RESTART => {
+            RESTART_REQUESTED.store(true, Ordering::Relaxed);
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_CLOSE => {
             unsafe {
                 let _ = DestroyWindow(hwnd);

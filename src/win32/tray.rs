@@ -1,4 +1,5 @@
 use crate::win32::taskbar_embed;
+use crate::win32::message_loop;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
@@ -16,6 +17,7 @@ const TRAY_ICON_ID: u32 = 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
 const IDM_EXIT: u32 = 1001;
 const IDM_RETRY_ATTACH: u32 = 1002;
+const IDM_RESTART: u32 = 1003;
 
 pub fn init(message_hwnd: HWND) -> anyhow::Result<()> {
     unsafe {
@@ -64,6 +66,7 @@ fn show_context_menu(message_hwnd: HWND) {
         if taskbar_embed::is_tray_only(message_hwnd) {
             let _ = AppendMenuW(menu, MF_STRING, IDM_RETRY_ATTACH as usize, w!("重试附加"));
         }
+        let _ = AppendMenuW(menu, MF_STRING, IDM_RESTART as usize, w!("重启"));
         let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, w!("退出"));
         let mut pt = windows::Win32::Foundation::POINT::default();
         let _ = GetCursorPos(&mut pt);
@@ -83,6 +86,9 @@ fn show_context_menu(message_hwnd: HWND) {
             }
             IDM_RETRY_ATTACH => {
                 let _ = PostMessageW(message_hwnd, taskbar_embed::WM_APP_RETRY_ATTACH, WPARAM(0), LPARAM(0));
+            }
+            IDM_RESTART => {
+                let _ = PostMessageW(message_hwnd, message_loop::WM_APP_RESTART, WPARAM(0), LPARAM(0));
             }
             _ => {}
         }

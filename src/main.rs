@@ -28,19 +28,36 @@ fn run() -> anyhow::Result<()> {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "app boot");
     config::user::load_user_config()?;
     let user_config = config::user::get_user_config();
-    let _instance = SingleInstanceGuard::acquire("Local\\TaskbarAudio_SingleInstance")?;
-    if let Err(err) = autostart::ensure_auto_start(user_config.auto_start) {
-        tracing::warn!(error = %err, enabled = user_config.auto_start, "sync auto start failed");
+    let should_restart = {
+        let _instance = SingleInstanceGuard::acquire("Local\\TaskbarAudio_SingleInstance")?;
+        if let Err(err) = autostart::ensure_auto_start(user_config.auto_start) {
+            tracing::warn!(error = %err, enabled = user_config.auto_start, "sync auto start failed");
+        }
+        let loopback = LoopbackCapture::start_default_loopback(LoopbackCaptureConfig {
+            environment_volume: user_config.environment_volume,
+            ..Default::default()
+        })?;
+        let _ = audio::set_global_stream(loopback.stream());
+        let _loopback = loopback;
+        let loop_ = MessageLoop::new()?;
+        tracing::info!(version = env!("CARGO_PKG_VERSION"), "app started");
+        loop_.run()?;
+        crate::win32::message_loop::take_restart_requested()
+    };
+    if should_restart {
+        restart_current_process()?;
     }
-    let loopback = LoopbackCapture::start_default_loopback(LoopbackCaptureConfig {
-        environment_volume: user_config.environment_volume,
-        ..Default::default()
-    })?;
-    let _ = audio::set_global_stream(loopback.stream());
-    let _loopback = loopback;
-    let loop_ = MessageLoop::new()?;
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "app started");
-    loop_.run()?;
     tracing::info!("app exited");
+    Ok(())
+}
+
+fn restart_current_process() -> anyhow::Result<()> {
+    let exe_path = std::env::current_exe()?;
+    tracing::info!(path = %exe_path.display(), "restarting app");
+    let mut command = std::process::Command::new(&exe_path);
+    if let Some(exe_dir) = exe_path.parent() {
+        command.current_dir(exe_dir);
+    }
+    command.spawn()?;
     Ok(())
 }
