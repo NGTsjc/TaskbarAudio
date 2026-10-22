@@ -4,7 +4,10 @@ use std::sync::OnceLock;
 pub struct UiConfigConst;
 
 impl UiConfigConst {
-    pub const PANEL_WIDTH_PX: i32 = 320;
+    pub const BAR_WIDTH_PX: i32 = 5;
+    pub const PANEL_WIDTH_PX: i32 = SpectrumDefaults::BARS as i32 * Self::BAR_WIDTH_PX
+        + (SpectrumDefaults::BARS as i32 - 1) * Self::BAR_GAP_PX as i32
+        + 2 * Self::CONTENT_PAD_X_PX as i32;
     pub const COLORKEY_FUCHSIA_RGB: u32 = 0x00FF00FF;
     pub const WATCHDOG_INTERVAL_MS: u32 = 3000;
     pub const ATTACH_SETTLE_INTERVAL_MS: u32 = 50;

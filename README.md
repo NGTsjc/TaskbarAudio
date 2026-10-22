@@ -50,7 +50,7 @@ Create a `config.json` file in the same directory as the executable:
 
 The visualizer starts enabled on every launch. Press the configured shortcut or select **隐藏音频** (Hide audio) in the tray menu to pause it. Pausing stops audio capture (including the microphone in mixed mode), device polling, spectrum analysis, rendering, and taskbar maintenance timers. Only the tray, shortcut, and Windows message loop remain active.
 
-Press the shortcut again, select **显示音频** (Show audio), or double-click the tray icon while paused to resume. Resume recreates the visualizer using the current default audio devices. If the taskbar is unavailable, attachment retries continue until it becomes available. Visibility is not saved between launches. Startup and resume check taskbar geometry every 50 ms and show the panel after it has remained stable for at least 100 ms. The default spectrum uses 40 bars across a 290-pixel panel, with 5-pixel columns and 2-pixel gaps.
+Press the shortcut again, select **显示音频** (Show audio), or double-click the tray icon while paused to resume. Resume recreates the visualizer using the current default audio devices. If the taskbar is unavailable, attachment retries continue until it becomes available. Visibility is not saved between launches. Startup and resume check taskbar geometry every 50 ms and show the panel after it has remained stable for at least 100 ms. The panel width is calculated from the bar count, with 5-pixel columns, 2-pixel gaps, and 6-pixel padding on each side.
 
 ### Shortcut rules
 
