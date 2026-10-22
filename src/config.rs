@@ -1,5 +1,4 @@
 use serde::Deserialize;
-use std::sync::OnceLock;
 
 pub struct UiConfigConst;
 
@@ -47,52 +46,6 @@ pub type UiConfig = UiConfigConst;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
-pub struct SpectrumConfig {
-    pub fft_size: usize,
-    pub bars: usize,
-    pub min_hz: f32,
-    pub max_hz: f32,
-    pub update_hz: f32,
-    pub attack_ms: f32,
-    pub release_ms: f32,
-    pub gamma: f32,
-    pub noise_floor: f32,
-    pub bar_gain: f32,
-    pub bar_pow: f32,
-    pub vis_attack_ms: f32,
-    pub vis_release_ms: f32,
-    pub peak_fall_per_sec: f32,
-    pub color_glow_base: f32,
-    pub color_glow_range: f32,
-    pub silent_decay: f32,
-}
-
-impl Default for SpectrumConfig {
-    fn default() -> Self {
-        Self {
-            fft_size: 512,
-            bars: 64,
-            min_hz: 40.0,
-            max_hz: 16_000.0,
-            update_hz: 90.0,
-            attack_ms: 15.0,
-            release_ms: 150.0,
-            gamma: 0.55,
-            noise_floor: 0.0,
-            bar_gain: 3.10,
-            bar_pow: 0.50,
-            vis_attack_ms: 20.0,
-            vis_release_ms: 100.0,
-            peak_fall_per_sec: 1.35,
-            color_glow_base: 0.78,
-            color_glow_range: 0.22,
-            silent_decay: 0.985,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(default)]
 pub struct UserConfig {
     pub position: String,
     pub display_mode: String,
@@ -114,112 +67,6 @@ impl Default for UserConfig {
             toggle_hotkey: None,
         }
     }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(default)]
-pub struct AudioConfig {
-    pub block_frames: usize,
-    pub queue_capacity: usize,
-    pub no_data_fill_interval_ms: u64,
-    pub smooth_tau_ms: u64,
-}
-
-impl Default for AudioConfig {
-    fn default() -> Self {
-        Self {
-            block_frames: 1024,
-            queue_capacity: 8,
-            no_data_fill_interval_ms: 20,
-            smooth_tau_ms: 180,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(default)]
-pub struct LoggingConfig {
-    pub level: String,
-    pub file_enabled: bool,
-}
-
-impl Default for LoggingConfig {
-    fn default() -> Self {
-        Self {
-            level: "debug".to_string(),
-            file_enabled: false,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(default)]
-pub struct AppConfig {
-    pub spectrum: SpectrumConfig,
-    pub user: UserConfig,
-    pub audio: AudioConfig,
-    pub logging: LoggingConfig,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            spectrum: SpectrumConfig::default(),
-            user: UserConfig::default(),
-            audio: AudioConfig::default(),
-            logging: LoggingConfig::default(),
-        }
-    }
-}
-
-static APP_CONFIG: OnceLock<AppConfig> = OnceLock::new();
-
-pub fn load_config() -> anyhow::Result<()> {
-    let config_path = config_file_path()?;
-    let config = if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
-        match serde_json::from_str::<AppConfig>(&content) {
-            Ok(cfg) => {
-                tracing::info!(path = %config_path.display(), "config loaded");
-                cfg
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, path = %config_path.display(), "config parse failed, using defaults");
-                AppConfig::default()
-            }
-        }
-    } else {
-        tracing::debug!(path = %config_path.display(), "config not found, using defaults");
-        AppConfig::default()
-    };
-    APP_CONFIG.set(config).map_err(|_| anyhow::anyhow!("config already initialized"))?;
-    Ok(())
-}
-
-pub fn get_config() -> &'static AppConfig {
-    APP_CONFIG.get().expect("config not initialized")
-}
-
-pub fn get_spectrum_config() -> &'static SpectrumConfig {
-    &get_config().spectrum
-}
-
-pub fn get_user_config() -> &'static UserConfig {
-    &get_config().user
-}
-
-pub fn get_audio_config() -> &'static AudioConfig {
-    &get_config().audio
-}
-
-pub fn get_logging_config() -> &'static LoggingConfig {
-    &get_config().logging
-}
-
-fn config_file_path() -> anyhow::Result<std::path::PathBuf> {
-    let exe_path = std::env::current_exe()?;
-    let exe_dir = exe_path.parent().ok_or_else(|| anyhow::anyhow!("exe has no parent directory"))?;
-    Ok(exe_dir.join("config.json"))
 }
 
 pub struct SpectrumDefaults;
@@ -250,9 +97,16 @@ pub mod user {
 
     static USER_CONFIG: OnceLock<UserConfig> = OnceLock::new();
 
+    #[cfg(test)]
+    pub fn init_test_config() {
+        USER_CONFIG.get_or_init(UserConfig::default);
+    }
+
     pub fn load_user_config() -> anyhow::Result<()> {
         let config = load_user_config_from_file()?;
-        USER_CONFIG.set(config).map_err(|_| anyhow::anyhow!("user config already initialized"))?;
+        USER_CONFIG
+            .set(config)
+            .map_err(|_| anyhow::anyhow!("user config already initialized"))?;
         Ok(())
     }
 
@@ -262,18 +116,15 @@ pub mod user {
 
     fn load_user_config_from_file() -> anyhow::Result<UserConfig> {
         let exe_path = std::env::current_exe()?;
-        let exe_dir = exe_path.parent().ok_or_else(|| anyhow::anyhow!("exe has no parent directory"))?;
+        let exe_dir = exe_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("exe has no parent directory"))?;
         let config_path = exe_dir.join("config.json");
-        
+
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
-            match serde_json::from_str::<serde_json::Value>(&content) {
-                Ok(value) => {
-                    let user_config: UserConfig = if let Some(user) = value.get("user") {
-                        serde_json::from_value(user.clone())?
-                    } else {
-                        serde_json::from_str(&content)?
-                    };
+            match parse_user_config(&content) {
+                Ok(user_config) => {
                     tracing::info!(path = %config_path.display(), "user config loaded");
                     Ok(user_config)
                 }
@@ -289,7 +140,20 @@ pub mod user {
     }
 }
 
-fn deserialize_toggle_hotkey<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+fn parse_user_config(content: &str) -> serde_json::Result<UserConfig> {
+    // Accept a UTF-8 BOM from Windows editors and preserve both supported layouts.
+    let mut value: serde_json::Value =
+        serde_json::from_str(content.trim_start_matches('\u{feff}'))?;
+    if let Some(user) = value.get_mut("user") {
+        serde_json::from_value(user.take())
+    } else {
+        serde_json::from_value(value)
+    }
+}
+
+fn deserialize_toggle_hotkey<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
     let value = serde_json::Value::deserialize(deserializer)?;
     match value {
         serde_json::Value::Null => Ok(None),
@@ -307,18 +171,54 @@ mod hotkey_config_tests {
 
     #[test]
     fn invalid_hotkey_types_do_not_discard_other_settings() {
-        for value in [serde_json::json!(12), serde_json::json!(true), serde_json::json!([]), serde_json::json!({}), serde_json::Value::Null] {
-            let config: UserConfig = serde_json::from_value(serde_json::json!({"position": "left", "toggle_hotkey": value})).unwrap();
+        for value in [
+            serde_json::json!(12),
+            serde_json::json!(true),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::Value::Null,
+        ] {
+            let config: UserConfig = serde_json::from_value(
+                serde_json::json!({"position": "left", "toggle_hotkey": value}),
+            )
+            .unwrap();
             assert_eq!(config.position, "left");
             assert!(config.toggle_hotkey.is_none());
         }
         let config: UserConfig = serde_json::from_str(r#"{"toggle_hotkey":"Ctrl+Alt+V"}"#).unwrap();
         assert_eq!(config.toggle_hotkey.as_deref(), Some("Ctrl+Alt+V"));
-        assert!(serde_json::from_str::<UserConfig>("{}").unwrap().toggle_hotkey.is_none());
-        let nested: AppConfig = serde_json::from_str(
-            r#"{"user":{"position":"right","toggle_hotkey":"Ctrl+Alt+V"}}"#,
-        ).unwrap();
-        assert_eq!(nested.user.position, "right");
-        assert_eq!(nested.user.toggle_hotkey, config.toggle_hotkey);
+        assert!(
+            serde_json::from_str::<UserConfig>("{}")
+                .unwrap()
+                .toggle_hotkey
+                .is_none()
+        );
+        let nested =
+            parse_user_config(r#"{"user":{"position":"right","toggle_hotkey":"Ctrl+Alt+V"}}"#)
+                .unwrap();
+        assert_eq!(nested.position, "right");
+        assert_eq!(nested.toggle_hotkey, config.toggle_hotkey);
+    }
+
+    #[test]
+    fn actual_parser_supports_flat_nested_bom_and_old_config() {
+        for content in [
+            r#"{"position":"left","offset_x":12}"#,
+            r#"{"user":{"position":"left","offset_x":12}}"#,
+            "\u{feff}{\"position\":\"left\",\"offset_x\":12}",
+        ] {
+            let config = parse_user_config(content).unwrap();
+            assert_eq!(config.position, "left");
+            assert_eq!(config.offset_x, 12);
+            assert!(config.toggle_hotkey.is_none());
+            assert!(!config.environment_volume);
+        }
+        let config =
+            parse_user_config(r#"{"user":{"auto_start":true,"toggle_hotkey":[]}}"#).unwrap();
+        assert!(config.auto_start);
+        assert!(config.toggle_hotkey.is_none());
+        for content in ["{", "null", r#"{"user":false}"#, r#"{"offset_x":"wrong"}"#] {
+            assert!(parse_user_config(content).is_err());
+        }
     }
 }

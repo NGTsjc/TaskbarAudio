@@ -75,8 +75,10 @@ impl PanelRenderer {
         if size.width == 0 || size.height == 0 {
             return Ok(());
         }
-        if let Some(rt) = &self.hwnd_target {
-            unsafe { rt.Resize(&size)? };
+        if let Some(rt) = &self.hwnd_target
+            && let Err(error) = unsafe { rt.Resize(&size) } {
+            self.drop_device_resources();
+            return Err(error.into());
         }
         Ok(())
     }
@@ -88,6 +90,9 @@ impl PanelRenderer {
         let Some(rt) = self.target.clone() else { return Ok(false) };
         
         if self.last_energy < 1e-5 {
+            self.display_bars.fill(0.0);
+            self.peak_bars.fill(0.0);
+            self.last_anim_tick = std::time::Instant::now();
             return self.clear_canvas(rt);
         }
         
@@ -187,7 +192,11 @@ impl PanelRenderer {
         let rt: ID2D1RenderTarget = hwnd_rt.cast()?;
         self.hwnd_target = Some(hwnd_rt);
         self.target = Some(rt);
-        self.recreate_brushes()?;
+        if let Err(error) = self.recreate_brushes() {
+            // Retry the whole resource set on the next frame after partial failure.
+            self.drop_device_resources();
+            return Err(error);
+        }
         Ok(())
     }
 

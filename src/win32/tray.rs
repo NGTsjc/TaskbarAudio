@@ -9,7 +9,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, PostMessageW,
     SetForegroundWindow, TrackPopupMenu, HICON, IDI_APPLICATION, MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_LBUTTONDBLCLK, WM_RBUTTONUP,
+    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_NULL,
 };
 use windows::core::w;
 
@@ -26,7 +26,7 @@ pub fn init(message_hwnd: HWND) -> anyhow::Result<()> {
         nid.uCallbackMessage = WM_APP_TRAY;
         nid.hIcon = load_icon();
         set_tip(&mut nid, "TaskbarAudio");
-        let ok = Shell_NotifyIconW(NIM_ADD, &mut nid).as_bool();
+        let ok = Shell_NotifyIconW(NIM_ADD, &nid).as_bool();
         anyhow::ensure!(ok, "Shell_NotifyIconW(NIM_ADD) failed");
     }
     Ok(())
@@ -34,8 +34,8 @@ pub fn init(message_hwnd: HWND) -> anyhow::Result<()> {
 
 pub fn shutdown(message_hwnd: HWND) {
     unsafe {
-        let mut nid = build_nid(message_hwnd, NOTIFY_ICON_DATA_FLAGS(0));
-        let _ = Shell_NotifyIconW(NIM_DELETE, &mut nid);
+        let nid = build_nid(message_hwnd, NOTIFY_ICON_DATA_FLAGS(0));
+        let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
     }
 }
 
@@ -88,6 +88,8 @@ fn show_context_menu(message_hwnd: HWND) {
             message_hwnd,
             None,
         );
+        // Complete the foreground-menu cycle so the next click can dismiss it.
+        let _ = PostMessageW(message_hwnd, WM_NULL, WPARAM(0), LPARAM(0));
         match cmd.0 as u32 {
             IDM_TOGGLE_AUDIO => {
                 let _ = PostMessageW(message_hwnd, taskbar_embed::WM_APP_TOGGLE_AUDIO, WPARAM(0), LPARAM(0));
@@ -109,23 +111,22 @@ fn show_context_menu(message_hwnd: HWND) {
 
 unsafe fn load_icon() -> HICON {
     let instance = unsafe { GetModuleHandleW(None) }.ok();
-    if let Some(instance) = instance {
-        if let Ok(icon) = unsafe { LoadIconW(instance, w!("MAINICON")) } {
-            if !icon.is_invalid() {
-                return icon;
-            }
-        }
+    if let Some(instance) = instance
+        && let Ok(icon) = unsafe { LoadIconW(instance, w!("MAINICON")) }
+        && !icon.is_invalid() {
+        return icon;
     }
     unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default()
 }
 
 unsafe fn build_nid(message_hwnd: HWND, flags: NOTIFY_ICON_DATA_FLAGS) -> NOTIFYICONDATAW {
-    let mut nid = NOTIFYICONDATAW::default();
-    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-    nid.hWnd = message_hwnd;
-    nid.uID = TRAY_ICON_ID;
-    nid.uFlags = flags;
-    nid
+    NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: message_hwnd,
+        uID: TRAY_ICON_ID,
+        uFlags: flags,
+        ..Default::default()
+    }
 }
 
 fn set_tip(nid: &mut NOTIFYICONDATAW, tip: &str) {

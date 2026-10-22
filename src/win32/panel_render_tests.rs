@@ -112,7 +112,7 @@ fn resume_keeps_pixel_bounds_and_thicker_bars_at_every_dpi() {
         let canvas = unsafe { rt.GetSize() };
         assert_eq!((canvas.width, canvas.height), (width as f32, height as f32));
         for (mode, line) in [false, true].into_iter().enumerate() {
-            let energy = 0.0048923218;
+            let energy = 0.004_892_322;
             renderer.display_bars.fill(energy);
             renderer.peak_bars.fill(energy);
             unsafe {

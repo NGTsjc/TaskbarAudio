@@ -45,10 +45,9 @@ pub fn init(message_hwnd: HWND) -> anyhow::Result<()> {
         let controller = Box::into_raw(controller);
         SetWindowLongPtrW(message_hwnd, GWLP_USERDATA, controller as isize);
     }
-    if let Some(controller) = unsafe { get_controller_mut(message_hwnd) } {
-        if let Err(error) = controller.resume(message_hwnd) {
-            tracing::warn!(%error, "audio initialization failed; use tray to resume");
-        }
+    if let Some(controller) = unsafe { get_controller_mut(message_hwnd) }
+        && let Err(error) = controller.resume(message_hwnd) {
+        tracing::warn!(%error, "audio initialization failed; use tray to resume");
     }
     Ok(())
 }
@@ -66,7 +65,7 @@ pub fn handle_message(message_hwnd: HWND, msg: u32, wparam: WPARAM, _lparam: LPA
         }
         return Some(LRESULT(0));
     }
-    if is_paused(message_hwnd) && (msg == WM_TIMER || msg == WM_APP_RETRY_ATTACH) {
+    if (msg == WM_TIMER || msg == WM_APP_RETRY_ATTACH) && is_paused(message_hwnd) {
         return Some(LRESULT(0));
     }
     match msg {
@@ -341,7 +340,7 @@ impl TaskbarEmbedController {
                 instance,
                 None,
             )?;
-            anyhow::ensure!(panel_hwnd.0 != std::ptr::null_mut(), "CreateWindowExW(panel) failed");
+            anyhow::ensure!(!panel_hwnd.0.is_null(), "CreateWindowExW(panel) failed");
             let _ = SetLayeredWindowAttributes(
                 panel_hwnd,
                 COLORREF(UiConfig::COLORKEY_FUCHSIA_RGB),
@@ -355,7 +354,7 @@ impl TaskbarEmbedController {
 
     fn recreate_panel_window(&mut self, shell: HWND) -> anyhow::Result<()> {
         unsafe {
-            if self.panel_hwnd.0 != std::ptr::null_mut() {
+            if !self.panel_hwnd.0.is_null() {
                 let _ = DestroyWindow(self.panel_hwnd);
             }
             self.panel_hwnd = Self::create_panel_window(Some(shell))?;
@@ -379,7 +378,7 @@ impl TaskbarEmbedController {
                     return Ok(false);
                 }
             };
-            if shell.0 == std::ptr::null_mut() {
+            if shell.0.is_null() {
                 tracing::debug!("try_attach: shell window is null");
                 return Ok(false);
             }
@@ -673,10 +672,9 @@ extern "system" fn panel_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_SIZE => {
-            if let Some(state) = unsafe { get_panel_state_mut(hwnd) } {
-                if let Err(err) = state.renderer.on_size(hwnd) {
-                    tracing::debug!(error = %err, "panel resize failed");
-                }
+            if let Some(state) = unsafe { get_panel_state_mut(hwnd) }
+                && let Err(err) = state.renderer.on_size(hwnd) {
+                tracing::debug!(error = %err, "panel resize failed");
             }
             LRESULT(0)
         }
@@ -762,7 +760,7 @@ fn verify_panel_non_interactive(hwnd: HWND) {
         let lparam = LPARAM((((y as u32) & 0xFFFF) << 16 | ((x as u32) & 0xFFFF)) as isize);
         let ht = SendMessageW(hwnd, WM_NCHITTEST, WPARAM(0), lparam).0 as u32;
         let ma = SendMessageW(hwnd, WM_MOUSEACTIVATE, WPARAM(0), LPARAM(0)).0 as u32;
-        if ht != HTTRANSPARENT as u32 || ma != MA_NOACTIVATE as u32 {
+        if ht != HTTRANSPARENT as u32 || ma != MA_NOACTIVATE {
             tracing::warn!(ht, ma, "panel non-interactive verification failed");
         }
     }
@@ -778,7 +776,8 @@ mod lifecycle_tests {
 
     #[test]
     fn pause_resume_releases_and_recreates_runtime() {
-        crate::config::user::load_user_config().unwrap();
+        let _runtime_lock = crate::win32::RUNTIME_TEST_LOCK.lock().unwrap();
+        crate::config::user::init_test_config();
         // Exercise the native controller without requiring an interactive shell/tray.
         let instance = unsafe { GetModuleHandleW(None) }.unwrap();
         let hwnd = unsafe {

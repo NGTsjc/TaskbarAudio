@@ -16,10 +16,8 @@ pub fn init() -> anyhow::Result<LoggingGuard> {
     });
 
     let file_enabled = std::env::var("TASKBARAUDIO_LOG_FILE").is_ok();
-    if file_enabled {
-        if let Ok(guard) = init_file_logger(env_filter.clone()) {
-            return Ok(guard);
-        }
+    if file_enabled && let Ok(guard) = init_file_logger(env_filter.clone()) {
+        return Ok(guard);
     }
 
     tracing_subscriber::fmt()

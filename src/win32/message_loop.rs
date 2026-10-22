@@ -1,21 +1,21 @@
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 use crate::config::UiConfig;
 use crate::win32::{hotkey, taskbar_embed, tray};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Console::{
-    SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
-    CTRL_SHUTDOWN_EVENT,
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    SetConsoleCtrlHandler,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, TranslateMessage, IsWindow,
-    CS_HREDRAW, CS_VREDRAW,
-    HMENU, MSG, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WNDCLASSW,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetMessageW, HMENU, IsWindow, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+    RegisterWindowMessageW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY,
+    WM_HOTKEY, WNDCLASSW,
 };
 use windows::core::w;
 
-static EXIT_HWND_ADDR: OnceLock<isize> = OnceLock::new();
+static EXIT_HWND_ADDR: AtomicIsize = AtomicIsize::new(0);
 static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -53,14 +53,19 @@ impl MessageLoop {
                 instance,
                 None,
             )?;
-            anyhow::ensure!(hwnd.0 != std::ptr::null_mut(), "CreateWindowExW failed");
-            let _ = EXIT_HWND_ADDR.set(hwnd.0 as isize);
+            anyhow::ensure!(!hwnd.0.is_null(), "CreateWindowExW failed");
+            EXIT_HWND_ADDR.store(hwnd.0 as isize, Ordering::Relaxed);
             let loop_ = Self { hwnd };
             setup_console_ctrl_handler()?;
             TASKBAR_CREATED.get_or_init(|| RegisterWindowMessageW(w!("TaskbarCreated")));
             tray::init(hwnd)?;
             taskbar_embed::init(hwnd)?;
-            hotkey::register(hwnd, crate::config::user::get_user_config().toggle_hotkey.as_deref());
+            hotkey::register(
+                hwnd,
+                crate::config::user::get_user_config()
+                    .toggle_hotkey
+                    .as_deref(),
+            );
             Ok(loop_)
         }
     }
@@ -80,7 +85,12 @@ impl MessageLoop {
     pub fn run(self) -> anyhow::Result<()> {
         unsafe {
             let mut msg = MSG::default();
-            while GetMessageW(&mut msg, None, 0, 0).into() {
+            loop {
+                match GetMessageW(&mut msg, None, 0, 0).0 {
+                    -1 => return Err(windows::core::Error::from_win32().into()),
+                    0 => break,
+                    _ => {}
+                }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
@@ -95,6 +105,8 @@ pub fn take_restart_requested() -> bool {
 
 impl Drop for MessageLoop {
     fn drop(&mut self) {
+        EXIT_HWND_ADDR.store(0, Ordering::Relaxed);
+        let _ = unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), false) };
         if unsafe { IsWindow(self.hwnd) }.as_bool() {
             let _ = unsafe { DestroyWindow(self.hwnd) };
         }
@@ -102,7 +114,10 @@ impl Drop for MessageLoop {
 }
 
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if TASKBAR_CREATED.get().is_some_and(|id| *id != 0 && msg == *id) {
+    if TASKBAR_CREATED
+        .get()
+        .is_some_and(|id| *id != 0 && msg == *id)
+    {
         if let Err(error) = tray::init(hwnd) {
             tracing::warn!(%error, "restore tray icon failed");
         }
@@ -117,7 +132,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     match msg {
         WM_HOTKEY if wparam.0 == hotkey::TOGGLE_HOTKEY_ID as usize => {
             unsafe {
-                let _ = PostMessageW(hwnd, taskbar_embed::WM_APP_TOGGLE_AUDIO, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(
+                    hwnd,
+                    taskbar_embed::WM_APP_TOGGLE_AUDIO,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
             }
             LRESULT(0)
         }
@@ -155,23 +175,21 @@ fn setup_console_ctrl_handler() -> anyhow::Result<()> {
 extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
     match ctrl_type {
         CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => {
-            if let Some(hwnd_addr) = EXIT_HWND_ADDR.get() {
+            let hwnd_addr = EXIT_HWND_ADDR.load(Ordering::Relaxed);
+            if hwnd_addr != 0 {
                 unsafe {
-                    let _ = PostMessageW(HWND(*hwnd_addr as _), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    let _ = PostMessageW(HWND(hwnd_addr as _), WM_CLOSE, WPARAM(0), LPARAM(0));
                 }
-            } else {
-                unsafe { PostQuitMessage(0) };
             }
             BOOL(1)
         }
         CTRL_CLOSE_EVENT => {
             if UiConfig::EXIT_ON_CONSOLE_CLOSE {
-                if let Some(hwnd_addr) = EXIT_HWND_ADDR.get() {
+                let hwnd_addr = EXIT_HWND_ADDR.load(Ordering::Relaxed);
+                if hwnd_addr != 0 {
                     unsafe {
-                        let _ = PostMessageW(HWND(*hwnd_addr as _), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        let _ = PostMessageW(HWND(hwnd_addr as _), WM_CLOSE, WPARAM(0), LPARAM(0));
                     }
-                } else {
-                    unsafe { PostQuitMessage(0) };
                 }
             }
             BOOL(1)
@@ -179,3 +197,7 @@ extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
         _ => BOOL(0),
     }
 }
+
+#[cfg(test)]
+#[path = "desktop_tests.rs"]
+mod desktop_tests;

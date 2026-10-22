@@ -22,6 +22,27 @@ A Windows taskbar audio visualizer component.
 cargo build --release
 ```
 
+`Cargo.lock` pins the application dependencies. CI uses `--locked`, runs tests
+before creating a tag release, and checks normal `master` pushes and pull requests.
+
+## Development checks
+
+```powershell
+cargo test --offline
+cargo clippy --offline --all-targets -- -D warnings
+cargo build --release --locked
+# Requires working Windows playback and microphone devices:
+cargo test --offline live_system_and_mixed_capture_restart -- --ignored --nocapture
+# Interactive desktop; exit the running visualizer first:
+cargo test --offline desktop_hotkey_tray_resume_and_restart -- --ignored --nocapture
+```
+
+The regular tests cover shortcut/config parsing, audio decoding and mixing,
+thread shutdown, FFT output, panel lifecycle, and bar/line pixel bounds at multiple
+DPI settings. The optional device test starts and stops both capture modes twice.
+The optional desktop test checks hotkey registration, message routing, tray
+double-click resume, panel bounds, recovery after panel loss, and restart while paused.
+
 ## Configuration
 
 Create a `config.json` file in the same directory as the executable:
@@ -42,9 +63,13 @@ Create a `config.json` file in the same directory as the executable:
 - `position`: `left`, `center`, `right`
 - `display_mode`: `bar`, `line`
 - `offset_x`: Horizontal offset in pixels (positive = right, negative = left)
-- `environment_volume`: Enable mixed audio capture (system + microphone)
+- `environment_volume`: Enable mixed audio capture (system + microphone). Windows converts microphone audio to the system audio format before mixing. Changes to either default device restart capture.
 - `auto_start`: Enable Windows auto start via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 - `toggle_hotkey`: Optional global shortcut, for example `"Ctrl+Alt+V"`. Omit it, use `null`, or leave it empty to disable. Configuration changes take effect after restart. Both flat configuration and options nested inside `"user"` are supported.
+
+UTF-8 files with or without a BOM are supported. Malformed JSON or invalid option
+types fall back to defaults with a warning; an invalid `toggle_hotkey` value only
+disables the shortcut and preserves the other options.
 
 ### Hide, pause, and resume
 

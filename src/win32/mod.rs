@@ -4,3 +4,6 @@ pub mod panel_render;
 pub mod taskbar_embed;
 pub mod taskbar_layout;
 pub mod tray;
+
+#[cfg(test)]
+pub(crate) static RUNTIME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

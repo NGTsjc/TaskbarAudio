@@ -1,16 +1,11 @@
-use crate::audio::types::AudioBlock;
+use crate::audio::types::{AudioBlock, AudioFormat};
 use crate::config::SpectrumDefaults;
 use std::collections::VecDeque;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WindowFunction {
+    #[default]
     Hann,
-}
-
-impl Default for WindowFunction {
-    fn default() -> Self {
-        Self::Hann
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -54,6 +49,8 @@ pub struct SpectrumAnalyzer {
     window: Vec<f32>,
     mono_ring: VecDeque<f32>,
     fft_buf: Vec<Complex32>,
+    fft_plan: FftPlan,
+    last_format: Option<AudioFormat>,
     prev_bars: Vec<f32>,
     last_output_frame: Option<usize>,
     frame_count: usize,
@@ -61,10 +58,34 @@ pub struct SpectrumAnalyzer {
 
 impl SpectrumAnalyzer {
     pub fn new(config: SpectrumConfig) -> anyhow::Result<Self> {
-        anyhow::ensure!(config.fft_size.is_power_of_two(), "fft_size must be power of two");
+        anyhow::ensure!(
+            config.fft_size.is_power_of_two(),
+            "fft_size must be power of two"
+        );
         anyhow::ensure!(config.fft_size >= 16, "fft_size too small");
         anyhow::ensure!(config.bars >= 1, "bars must be >= 1");
-        anyhow::ensure!(config.update_hz > 0.0, "update_hz must be > 0");
+        anyhow::ensure!(
+            config.update_hz.is_finite() && config.update_hz > 0.0,
+            "update_hz must be finite and > 0"
+        );
+        anyhow::ensure!(
+            config.min_hz.is_finite()
+                && config.max_hz.is_finite()
+                && config.min_hz >= 0.0
+                && config.max_hz > config.min_hz,
+            "invalid frequency range"
+        );
+        anyhow::ensure!(
+            [
+                config.attack_ms,
+                config.release_ms,
+                config.gamma,
+                config.noise_floor
+            ]
+            .iter()
+            .all(|v| v.is_finite() && *v >= 0.0),
+            "invalid spectrum response parameter"
+        );
         let window = build_window(config.fft_size, config.window);
         let fft_buf = vec![Complex32::default(); config.fft_size];
         Ok(Self {
@@ -72,6 +93,8 @@ impl SpectrumAnalyzer {
             window,
             mono_ring: VecDeque::with_capacity(config.fft_size * 2),
             fft_buf,
+            fft_plan: FftPlan::new(config.fft_size),
+            last_format: None,
             prev_bars: vec![0.0; config.bars],
             last_output_frame: None,
             frame_count: 0,
@@ -79,7 +102,27 @@ impl SpectrumAnalyzer {
     }
 
     pub fn process_block(&mut self, block: &AudioBlock) -> Option<SpectrumFrame> {
+        if block.format.channels == 0
+            || block.format.sample_rate == 0
+            || block.frames == 0
+            || block.frames.checked_mul(block.format.channels as usize) != Some(block.samples.len())
+        {
+            return None;
+        }
+        if self.last_format != Some(block.format) {
+            self.mono_ring.clear();
+            self.prev_bars.fill(0.0);
+            self.last_output_frame = None;
+            self.frame_count = 0;
+            self.last_format = Some(block.format);
+        }
         push_block_mono(&mut self.mono_ring, block);
+        // Bound memory even when the output cadence has not been reached.
+        let excess = self
+            .mono_ring
+            .len()
+            .saturating_sub(self.config.fft_size * 2);
+        self.mono_ring.drain(..excess);
         self.frame_count += block.frames;
         if self.mono_ring.len() < self.config.fft_size {
             return None;
@@ -91,19 +134,20 @@ impl SpectrumAnalyzer {
                 return None;
             }
         }
-        while self.mono_ring.len() > self.config.fft_size * 2 {
-            let _ = self.mono_ring.pop_front();
-        }
         let sr = block.format.sample_rate as f32;
         let max_hz = self.config.max_hz.min(sr * 0.5);
         let min_hz = self.config.min_hz.max(0.0).min(max_hz.max(0.0));
         let sample_offset = self.mono_ring.len().saturating_sub(self.config.fft_size);
         for (i, c) in self.fft_buf.iter_mut().enumerate() {
-            let s = self.mono_ring.get(sample_offset + i).copied().unwrap_or(0.0);
+            let s = self
+                .mono_ring
+                .get(sample_offset + i)
+                .copied()
+                .unwrap_or(0.0);
             let w = self.window[i];
             *c = Complex32::new(s * w, 0.0);
         }
-        fft_in_place(&mut self.fft_buf);
+        self.fft_plan.transform(&mut self.fft_buf);
         let target = aggregate_bars(
             &self.fft_buf,
             sr,
@@ -181,13 +225,25 @@ fn aggregate_bars(
     let half = n / 2;
     let min_hz = min_hz.max(0.0);
     let max_hz = max_hz.max(min_hz);
-    let ratio = if max_hz > min_hz { max_hz / min_hz.max(1e-3) } else { 1.0 };
+    let ratio = if min_hz > 0.0 && max_hz > min_hz {
+        max_hz / min_hz
+    } else {
+        1.0
+    };
     let mut out = vec![0.0f32; bars];
-    for b in 0..bars {
+    for (b, output) in out.iter_mut().enumerate() {
         let t0 = b as f32 / bars as f32;
         let t1 = (b + 1) as f32 / bars as f32;
-        let f0 = if ratio > 1.0 { min_hz * ratio.powf(t0) } else { min_hz + (max_hz - min_hz) * t0 };
-        let f1 = if ratio > 1.0 { min_hz * ratio.powf(t1) } else { min_hz + (max_hz - min_hz) * t1 };
+        let f0 = if ratio > 1.0 {
+            min_hz * ratio.powf(t0)
+        } else {
+            min_hz + (max_hz - min_hz) * t0
+        };
+        let f1 = if ratio > 1.0 {
+            min_hz * ratio.powf(t1)
+        } else {
+            min_hz + (max_hz - min_hz) * t1
+        };
         let mut i0 = ((f0 * n as f32) / sample_rate).ceil() as isize;
         let mut i1 = ((f1 * n as f32) / sample_rate).floor() as isize;
         i0 = i0.clamp(1, (half as isize).saturating_sub(1));
@@ -204,7 +260,7 @@ fn aggregate_bars(
             }
         }
         let v = (peak - noise_floor).max(0.0);
-        out[b] = v.powf(gamma.max(0.01)).min(1.0);
+        *output = v.powf(gamma.max(0.01)).min(1.0);
     }
     out
 }
@@ -221,38 +277,51 @@ impl Complex32 {
     }
 }
 
-fn fft_in_place(buf: &mut [Complex32]) {
-    let n = buf.len();
-    if n <= 1 {
-        return;
-    }
-    let bits = (n as u32).trailing_zeros();
-    for i in 0..n {
-        let j = reverse_bits(i as u32, bits) as usize;
-        if j > i {
-            buf.swap(i, j);
-        }
-    }
-    let mut len = 2usize;
-    while len <= n {
-        let half = len / 2;
-        let step = std::f32::consts::TAU / len as f32;
-        for start in (0..n).step_by(len) {
-            for k in 0..half {
-                let a = -step * k as f32;
-                let w = Complex32::new(a.cos(), a.sin());
-                let u = buf[start + k];
-                let t = mul(w, buf[start + k + half]);
-                buf[start + k] = add(u, t);
-                buf[start + k + half] = sub(u, t);
-            }
-        }
-        len *= 2;
-    }
+struct FftPlan {
+    reversed: Vec<usize>,
+    twiddles: Vec<Complex32>,
 }
 
-fn reverse_bits(x: u32, bits: u32) -> u32 {
-    x.reverse_bits() >> (32 - bits)
+impl FftPlan {
+    fn new(n: usize) -> Self {
+        let bits = n.trailing_zeros();
+        Self {
+            reversed: (0..n)
+                .map(|i| i.reverse_bits() >> (usize::BITS - bits))
+                .collect(),
+            twiddles: (0..n / 2)
+                .map(|k| {
+                    let angle = -std::f32::consts::TAU * k as f32 / n as f32;
+                    Complex32::new(angle.cos(), angle.sin())
+                })
+                .collect(),
+        }
+    }
+
+    fn transform(&self, buf: &mut [Complex32]) {
+        let n = buf.len();
+        debug_assert_eq!(n, self.reversed.len());
+        for (i, &j) in self.reversed.iter().enumerate() {
+            if j > i {
+                buf.swap(i, j);
+            }
+        }
+        let mut len = 2usize;
+        while len <= n {
+            let half = len / 2;
+            let step = n / len;
+            for start in (0..n).step_by(len) {
+                for k in 0..half {
+                    let w = self.twiddles[step * k];
+                    let u = buf[start + k];
+                    let t = mul(w, buf[start + k + half]);
+                    buf[start + k] = add(u, t);
+                    buf[start + k + half] = sub(u, t);
+                }
+            }
+            len *= 2;
+        }
+    }
 }
 
 fn add(a: Complex32, b: Complex32) -> Complex32 {
@@ -270,6 +339,79 @@ fn mul(a: Complex32, b: Complex32) -> Complex32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_fft_matches_direct_transform() {
+        let n = 32;
+        let original: Vec<_> = (0..n)
+            .map(|i| Complex32::new((i as f32 * 0.7).sin(), 0.0))
+            .collect();
+        let mut actual = original.clone();
+        let plan = FftPlan::new(n);
+        plan.transform(&mut actual);
+        for (k, actual) in actual.iter().enumerate() {
+            let expected = original
+                .iter()
+                .enumerate()
+                .fold(Complex32::default(), |sum, (i, x)| {
+                    let angle = -std::f32::consts::TAU * (i * k) as f32 / n as f32;
+                    add(sum, mul(*x, Complex32::new(angle.cos(), angle.sin())))
+                });
+            assert!((actual.re - expected.re).abs() < 0.0001);
+            assert!((actual.im - expected.im).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn device_format_change_drops_previous_samples_and_smoothing() {
+        let mut analyzer = SpectrumAnalyzer::new(SpectrumConfig::default()).unwrap();
+        assert!(
+            analyzer
+                .process_block(&sine_block(1000.0, 48_000, 1024))
+                .is_some()
+        );
+        let silence = AudioBlock {
+            format: AudioFormat {
+                sample_rate: 44_100,
+                channels: 1,
+            },
+            samples: vec![0.0; 512],
+            frames: 512,
+        };
+        assert!(analyzer.process_block(&silence).is_none());
+        assert!(
+            analyzer
+                .process_block(&silence)
+                .unwrap()
+                .bars
+                .iter()
+                .all(|&v| v == 0.0)
+        );
+    }
+
+    #[test]
+    fn invalid_input_is_ignored_and_ring_stays_bounded_between_outputs() {
+        let mut analyzer = SpectrumAnalyzer::new(SpectrumConfig {
+            update_hz: 0.01,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut block = sine_block(1000.0, 48_000, 1024);
+        for _ in 0..100 {
+            analyzer.process_block(&block);
+        }
+        assert!(analyzer.mono_ring.len() <= 2048);
+        block.format.channels = 0;
+        assert!(analyzer.process_block(&block).is_none());
+        block.format.channels = 2;
+        assert!(analyzer.process_block(&block).is_none());
+        assert!(
+            SpectrumAnalyzer::new(SpectrumConfig {
+                update_hz: f32::INFINITY,
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
     fn sine_block(freq: f32, sr: u32, frames: usize) -> AudioBlock {
         let mut samples = Vec::with_capacity(frames);
         for i in 0..frames {
@@ -277,7 +419,10 @@ mod tests {
             samples.push((std::f32::consts::TAU * freq * t).sin());
         }
         AudioBlock {
-            format: crate::audio::types::AudioFormat { sample_rate: sr, channels: 1 },
+            format: crate::audio::types::AudioFormat {
+                sample_rate: sr,
+                channels: 1,
+            },
             samples,
             frames,
         }

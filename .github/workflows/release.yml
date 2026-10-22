@@ -10,6 +10,8 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -23,14 +25,19 @@ jobs:
       - name: Sync Cargo Version From Tag
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".Replace('v', '')
+          $version = $env:RELEASE_TAG -replace '^v', ''
           $content = Get-Content Cargo.toml -Raw
           $content = $content -replace '(?m)^version\s*=\s*".*?"\s*$', "version = `"$version`""
           Set-Content Cargo.toml $content -Encoding UTF8
           Write-Host "Cargo.toml version synced to $version"
+          cargo update --workspace
+          if ($LASTEXITCODE -ne 0) { throw "Failed to sync workspace lockfile" }
+
+      - name: Test
+        run: cargo test --locked
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Create release directory
         run: mkdir release
@@ -42,7 +49,7 @@ jobs:
 
       - name: Zip release
         run: |
-          $version = "${{ github.ref_name }}".Replace('v', '')
+          $version = $env:RELEASE_TAG -replace '^v', ''
           Compress-Archive -Path release\* -DestinationPath taskbar_audio_${version}_win64.zip
 
       - name: Upload artifact

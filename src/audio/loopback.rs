@@ -1,20 +1,18 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::audio::com::{Apartment, ComAllocation};
+use crate::audio::mixer::Mixer;
+use crate::audio::queue::AudioQueue;
+use crate::audio::sample_format::{SampleEncoding, decode_samples, parse_format};
+use crate::audio::types::{AudioBlock, AudioFormat};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use windows::Win32::Media::Audio::{
-    IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
-    WAVE_FORMAT_PCM,
+    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient, IAudioClient, IMMDevice,
+    IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, eCapture, eConsole, eRender,
 };
-use windows::Win32::Media::Audio::{eCapture, eConsole, eRender, MMDeviceEnumerator};
-use windows::Win32::Media::KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM;
-use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-use windows::Win32::System::Com::{
-    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
-};
-use crate::audio::queue::AudioQueue;
-use crate::audio::types::{AudioBlock, AudioFormat};
+use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
 
 #[derive(Clone, Copy, Debug)]
 pub struct LoopbackCaptureConfig {
@@ -38,7 +36,6 @@ impl Default for LoopbackCaptureConfig {
 pub struct LoopbackCapture {
     queue: AudioQueue,
     stop: Arc<AtomicBool>,
-    restart: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     notification_join: Option<JoinHandle<()>>,
 }
@@ -60,72 +57,56 @@ impl AudioStream {
 
 impl LoopbackCapture {
     pub fn start_default_loopback(config: LoopbackCaptureConfig) -> anyhow::Result<Self> {
-        let queue = AudioQueue::new(config.queue_capacity);
-        let stop = Arc::new(AtomicBool::new(false));
+        anyhow::ensure!(config.block_frames > 0, "block_frames must be positive");
+        anyhow::ensure!(config.queue_capacity > 0, "queue_capacity must be positive");
+        let mut capture = Self {
+            queue: AudioQueue::new(config.queue_capacity),
+            stop: Arc::new(AtomicBool::new(false)),
+            join: None,
+            notification_join: None,
+        };
         let restart = Arc::new(AtomicBool::new(false));
-        
-        let queue_clone = queue.clone();
-        let stop_clone = stop.clone();
-        let restart_clone = restart.clone();
-        
-        let join = std::thread::spawn(move || {
-            Self::capture_loop(config, queue_clone, stop_clone, restart_clone);
-        });
-        
-        let stop_clone2 = stop.clone();
-        let restart_clone2 = restart.clone();
-        let notification_join = std::thread::spawn(move || {
-            Self::poll_device_change(restart_clone2, stop_clone2, config.environment_volume);
-        });
-        
-        Ok(Self {
-            queue,
-            stop,
-            restart,
-            join: Some(join),
-            notification_join: Some(notification_join),
-        })
+        let queue = capture.queue.clone();
+        let stop = capture.stop.clone();
+        let restart_capture = restart.clone();
+        capture.join = Some(
+            std::thread::Builder::new()
+                .name("audio-capture".into())
+                .spawn(move || Self::capture_loop(config, queue, stop, restart_capture))?,
+        );
+        let stop = capture.stop.clone();
+        // If the second spawn fails, Drop stops and joins the first thread.
+        capture.notification_join = Some(
+            std::thread::Builder::new()
+                .name("audio-device-poll".into())
+                .spawn(move || {
+                    Self::poll_device_change(restart, stop, config.environment_volume)
+                })?,
+        );
+        Ok(capture)
     }
 
-    fn poll_device_change(
-        restart: Arc<AtomicBool>,
-        stop: Arc<AtomicBool>,
-        environment_volume: bool,
-    ) {
-        let com_initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
-        let mut last_device_id = String::new();
-        
-        while !stop.load(Ordering::Relaxed) {
-            let device_id = match Self::get_default_device_id(environment_volume) {
-                Ok(id) => id,
-                Err(_) => {
-                    std::thread::sleep(Duration::from_millis(500));
-                    continue;
-                }
-            };
-            
-            if !last_device_id.is_empty() && device_id != last_device_id {
-                tracing::info!(old_device = %last_device_id, new_device = %device_id, "default audio device changed");
-                restart.store(true, Ordering::Relaxed);
+    fn poll_device_change(restart: Arc<AtomicBool>, stop: Arc<AtomicBool>, mixed: bool) {
+        let _apartment = match Apartment::new() {
+            Ok(apartment) => apartment,
+            Err(error) => {
+                tracing::warn!(%error, "device polling COM initialization failed");
+                return;
             }
-            
-            last_device_id = device_id;
-            std::thread::sleep(Duration::from_millis(500));
+        };
+        let mut previous = None;
+        while !stop.load(Ordering::Relaxed) {
+            // Track both endpoints in mixed mode, including removal/reconnection.
+            if let Ok(devices) = default_device_ids(mixed) {
+                if previous.as_ref().is_some_and(|old| old != &devices) {
+                    tracing::info!("default audio devices changed");
+                    restart.store(true, Ordering::Relaxed);
+                }
+                previous = Some(devices);
+            }
+            std::thread::park_timeout(Duration::from_millis(500));
         }
-        
-        if com_initialized {
-            unsafe { CoUninitialize() };
-        }
-    }
-
-    fn get_default_device_id(environment_volume: bool) -> anyhow::Result<String> {
-        let enumerator: IMMDeviceEnumerator =
-            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
-        let data_flow = if environment_volume { eCapture } else { eRender };
-        let device = unsafe { enumerator.GetDefaultAudioEndpoint(data_flow, eConsole)? };
-        let id = unsafe { device.GetId()? };
-        let id_str = unsafe { id.to_string().map_err(|e| anyhow::anyhow!("failed to convert device id: {}", e))? };
-        Ok(id_str)
+        tracing::debug!("audio device polling stopped");
     }
 
     fn capture_loop(
@@ -135,347 +116,117 @@ impl LoopbackCapture {
         restart: Arc<AtomicBool>,
     ) {
         while !stop.load(Ordering::Relaxed) {
-            let com_initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
-            
-            match Self::capture_thread_inner(config, queue.clone(), stop.clone(), restart.clone()) {
-                Ok(_) => {}
-                Err(err) => {
-                    if !stop.load(Ordering::Relaxed) {
-                        tracing::warn!(error = %err, "capture thread failed, restarting...");
-                    }
-                }
-            }
-            
-            if com_initialized {
-                unsafe { CoUninitialize() };
-            }
-            
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            
-            std::thread::sleep(Duration::from_millis(100));
             restart.store(false, Ordering::Relaxed);
+            let result = (|| {
+                let _apartment = Apartment::new()?;
+                Self::capture_session(config, &queue, &stop, &restart)
+            })();
+            if let Err(error) = result
+                && !stop.load(Ordering::Relaxed)
+            {
+                tracing::warn!(%error, "capture failed; retrying with current default devices");
+            }
+            if !stop.load(Ordering::Relaxed) {
+                std::thread::park_timeout(Duration::from_millis(100));
+            }
         }
+        tracing::debug!("audio capture stopped");
     }
 
-    fn capture_thread_inner(
+    fn capture_session(
         config: LoopbackCaptureConfig,
-        queue: AudioQueue,
-        stop: Arc<AtomicBool>,
-        restart: Arc<AtomicBool>,
-    ) -> anyhow::Result<()> {
-        if config.environment_volume {
-            return Self::capture_mixed(config, queue, stop, restart);
-        }
-        
-        let enumerator: IMMDeviceEnumerator =
-            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
-        let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole)? };
-        
-        let device_id = unsafe { device.GetId()? };
-        let device_id_str = unsafe { device_id.to_string().unwrap_or_else(|_| "unknown".to_string()) };
-        
-        tracing::info!(device_id = %device_id_str, mode = "system", "started capturing from default audio device");
-        
-        let audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
-        let pwfx = unsafe { audio_client.GetMixFormat()? };
-        anyhow::ensure!(!pwfx.is_null(), "GetMixFormat returned null");
-        let (format, encoding, block_align_bytes) = unsafe { parse_format(pwfx)? };
-        let hns_buffer_duration: i64 = 10_000_000 / 10;
-        unsafe {
-            audio_client.Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK,
-                hns_buffer_duration,
-                0,
-                pwfx,
-                None,
-            )?;
-        }
-        unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(pwfx as _)) };
-        let capture_client: IAudioCaptureClient = unsafe { audio_client.GetService()? };
-        unsafe { audio_client.Start()? };
-        let mut last_fill = Instant::now();
-        let mut accum: Vec<f32> = Vec::with_capacity(config.block_frames * format.channels as usize);
-        
-        Self::capture_loop_inner(capture_client, format, encoding, block_align_bytes, config, &mut accum, queue, stop, restart, &mut last_fill)
-    }
-
-    fn capture_mixed(
-        config: LoopbackCaptureConfig,
-        queue: AudioQueue,
-        stop: Arc<AtomicBool>,
-        restart: Arc<AtomicBool>,
+        queue: &AudioQueue,
+        stop: &AtomicBool,
+        restart: &AtomicBool,
     ) -> anyhow::Result<()> {
         let enumerator: IMMDeviceEnumerator =
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
-        
         let render_device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole)? };
-        let capture_device = unsafe { enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)? };
-        
-        let render_id = unsafe { render_device.GetId()? };
-        let capture_id = unsafe { capture_device.GetId()? };
-        let render_id_str = unsafe { render_id.to_string().unwrap_or_else(|_| "unknown".to_string()) };
-        let capture_id_str = unsafe { capture_id.to_string().unwrap_or_else(|_| "unknown".to_string()) };
-        
-        tracing::info!(render_device = %render_id_str, capture_device = %capture_id_str, mode = "mixed", "started capturing mixed audio");
-        
         let render_client: IAudioClient = unsafe { render_device.Activate(CLSCTX_ALL, None)? };
-        let capture_audio_client: IAudioClient = unsafe { capture_device.Activate(CLSCTX_ALL, None)? };
-        
-        let render_pwfx = unsafe { render_client.GetMixFormat()? };
-        let capture_pwfx = unsafe { capture_audio_client.GetMixFormat()? };
-        anyhow::ensure!(!render_pwfx.is_null() && !capture_pwfx.is_null(), "GetMixFormat returned null");
-        
-        let (format, encoding, block_align_bytes) = unsafe { parse_format(render_pwfx)? };
-        let hns_buffer_duration: i64 = 10_000_000 / 10;
-        
-        unsafe {
-            render_client.Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK,
-                hns_buffer_duration,
-                0,
-                render_pwfx,
-                None,
-            )?;
-            capture_audio_client.Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                0,
-                hns_buffer_duration,
-                0,
-                capture_pwfx,
-                None,
-            )?;
-        }
-        
-        unsafe {
-            windows::Win32::System::Com::CoTaskMemFree(Some(render_pwfx as _));
-            windows::Win32::System::Com::CoTaskMemFree(Some(capture_pwfx as _));
-        }
-        
-        let render_capture_client: IAudioCaptureClient = unsafe { render_client.GetService()? };
-        let mic_capture_client: IAudioCaptureClient = unsafe { capture_audio_client.GetService()? };
-        
-        unsafe {
-            render_client.Start()?;
-            capture_audio_client.Start()?;
-        }
-        
-        let mut render_accum: Vec<f32> = Vec::with_capacity(config.block_frames * format.channels as usize);
-        let mut mic_accum: Vec<f32> = Vec::with_capacity(config.block_frames * format.channels as usize);
-        
-        while !stop.load(Ordering::Relaxed) {
-            if restart.load(Ordering::Relaxed) {
-                tracing::info!("device change detected, restarting capture");
-                break;
-            }
-            
-            let render_block = Self::get_next_audio_block(&render_capture_client, format, encoding, block_align_bytes, config.block_frames);
-            let mic_block = Self::get_next_audio_block(&mic_capture_client, format, encoding, block_align_bytes, config.block_frames);
-            
-            render_accum.extend_from_slice(&render_block);
-            mic_accum.extend_from_slice(&mic_block);
-            
-            let max_len = render_accum.len().max(mic_accum.len());
-            while render_accum.len() < max_len {
-                render_accum.push(0.0);
-            }
-            while mic_accum.len() < max_len {
-                mic_accum.push(0.0);
-            }
-            
-            let block_size = config.block_frames * format.channels as usize;
-            
-            while render_accum.len() >= block_size && mic_accum.len() >= block_size {
-                let mut mixed = Vec::with_capacity(block_size);
-                for i in 0..block_size {
-                    let combined = render_accum[i] + mic_accum[i];
-                    mixed.push(combined * 0.5);
-                }
-                render_accum.drain(0..block_size);
-                mic_accum.drain(0..block_size);
-                
-                queue.push(AudioBlock {
-                    format,
-                    samples: mixed,
-                    frames: config.block_frames,
-                });
-            }
-            
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        
-        unsafe {
-            let _ = render_client.Stop();
-            let _ = capture_audio_client.Stop();
-        }
-        
-        Ok(())
-    }
-
-    fn get_next_audio_block(
-        capture_client: &IAudioCaptureClient,
-        format: AudioFormat,
-        encoding: SampleEncoding,
-        block_align_bytes: usize,
-        block_frames: usize,
-    ) -> Vec<f32> {
-        let hr = unsafe { capture_client.GetNextPacketSize() };
-        if hr.is_err() {
-            return vec![0.0; block_frames * format.channels as usize];
-        }
-        let packet_frames = hr.unwrap();
-        if packet_frames == 0 {
-            return vec![0.0; block_frames * format.channels as usize];
-        }
-        
-        let mut packet_frames = packet_frames;
-        let mut result = Vec::new();
-        
-        while packet_frames > 0 {
-            let mut data_ptr: *mut u8 = std::ptr::null_mut();
-            let mut num_frames = 0u32;
-            let mut flags = 0u32;
-            
-            let hr = unsafe {
-                capture_client.GetBuffer(
-                    &mut data_ptr,
-                    &mut num_frames,
-                    &mut flags,
-                    None,
-                    None,
-                )
-            };
-            
-            if hr.is_err() {
-                break;
-            }
-            
-            let samples = if (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0 {
-                vec![0.0; num_frames as usize * format.channels as usize]
-            } else {
-                let bytes_len = num_frames as usize * block_align_bytes;
-                unsafe { decode_samples(data_ptr, bytes_len, format.channels, encoding) }
-            };
-            
-            unsafe { capture_client.ReleaseBuffer(num_frames) };
-            
-            result.extend_from_slice(&samples);
-            packet_frames = 0;
-        }
-        
-        result
-    }
-
-    fn capture_loop_inner(
-        capture_client: IAudioCaptureClient,
-        format: AudioFormat,
-        encoding: SampleEncoding,
-        block_align_bytes: usize,
-        config: LoopbackCaptureConfig,
-        accum: &mut Vec<f32>,
-        queue: AudioQueue,
-        stop: Arc<AtomicBool>,
-        restart: Arc<AtomicBool>,
-        last_fill: &mut Instant,
-    ) -> anyhow::Result<()> {
-        while !stop.load(Ordering::Relaxed) {
-            if restart.load(Ordering::Relaxed) {
-                tracing::info!("device change detected, restarting capture");
-                break;
-            }
-            
-            let hr = unsafe { capture_client.GetNextPacketSize() };
-            if hr.is_err() {
-                tracing::warn!("GetNextPacketSize failed, restarting capture");
-                break;
-            }
-            
-            let mut packet_frames = hr.unwrap();
-            
-            if packet_frames == 0 {
-                let now = Instant::now();
-                if now.duration_since(*last_fill) >= config.no_data_fill_interval {
-                    let samples_len = config.block_frames * format.channels as usize;
-                    let samples = vec![0.0; samples_len];
+        let mix_format = ComAllocation(unsafe { render_client.GetMixFormat()? });
+        anyhow::ensure!(!mix_format.0.is_null(), "GetMixFormat returned null");
+        let (format, encoding, block_align) = unsafe { parse_format(mix_format.0)? };
+        let render = CaptureEndpoint::new(
+            render_client,
+            mix_format.0,
+            AUDCLNT_STREAMFLAGS_LOOPBACK,
+            format,
+            encoding,
+            block_align,
+        )?;
+        let mic = if config.environment_volume {
+            let device = unsafe { enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)? };
+            let client = unsafe { device.Activate(CLSCTX_ALL, None)? };
+            // Windows converts microphone rate, channels and encoding to the
+            // render format. Never interpret native microphone bytes as speaker bytes.
+            Some(CaptureEndpoint::new(
+                client,
+                mix_format.0,
+                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+                format,
+                encoding,
+                block_align,
+            )?)
+        } else {
+            None
+        };
+        drop(mix_format);
+        let block_samples = config
+            .block_frames
+            .checked_mul(format.channels as usize)
+            .ok_or_else(|| anyhow::anyhow!("audio block is too large"))?;
+        let fill_interval = config.no_data_fill_interval.max(Duration::from_secs_f64(
+            config.block_frames as f64 / format.sample_rate as f64,
+        ));
+        let mut last_output = Instant::now();
+        let started = last_output;
+        let mut accum = std::collections::VecDeque::new();
+        let mut mixer = Mixer::new(config.block_frames, format.channels, format.sample_rate);
+        tracing::info!(device = %device_id(&render_device)?, mixed = mic.is_some(),
+            sample_rate = format.sample_rate, channels = format.channels, "audio capture started");
+        while !stop.load(Ordering::Relaxed) && !restart.load(Ordering::Relaxed) {
+            let render_samples = render.read_available(stop, restart)?;
+            if let Some(mic) = &mic {
+                mixer.push(0, render_samples);
+                mixer.push(1, mic.read_available(stop, restart)?);
+                for _ in 0..config.queue_capacity {
+                    let Some(samples) = mixer.pop(started.elapsed()) else {
+                        break;
+                    };
                     queue.push(AudioBlock {
                         format,
                         samples,
                         frames: config.block_frames,
                     });
-                    *last_fill = now;
-                } else {
-                    std::thread::sleep(Duration::from_millis(1));
+                    if stop.load(Ordering::Relaxed) || restart.load(Ordering::Relaxed) {
+                        break;
+                    }
                 }
-                continue;
-            }
-            
-            while packet_frames > 0 && !stop.load(Ordering::Relaxed) {
-                if restart.load(Ordering::Relaxed) {
-                    tracing::info!("device change detected during capture, stopping");
-                    break;
-                }
-                
-                let mut data_ptr: *mut u8 = std::ptr::null_mut();
-                let mut num_frames = 0u32;
-                let mut flags = 0u32;
-                
-                let hr = unsafe {
-                    capture_client.GetBuffer(
-                        &mut data_ptr,
-                        &mut num_frames,
-                        &mut flags,
-                        None,
-                        None,
-                    )
-                };
-                
-                if hr.is_err() {
-                    tracing::warn!("GetBuffer failed, restarting capture");
-                    break;
-                }
-                
-                let samples = if (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0 {
-                    vec![0.0; num_frames as usize * format.channels as usize]
-                } else {
-                    let bytes_len = num_frames as usize * block_align_bytes;
-                    unsafe { decode_samples(data_ptr, bytes_len, format.channels, encoding) }
-                };
-                
-                let hr = unsafe { capture_client.ReleaseBuffer(num_frames) };
-                if hr.is_err() {
-                    tracing::warn!("ReleaseBuffer failed, restarting capture");
-                    break;
-                }
-                
-                accum.extend_from_slice(&samples);
-                
-                while accum.len() >= config.block_frames * format.channels as usize {
-                    let take = config.block_frames * format.channels as usize;
-                    let block_samples = accum.drain(0..take).collect::<Vec<_>>();
+            } else {
+                accum.extend(render_samples);
+                while accum.len() >= block_samples {
+                    let samples = accum.drain(..block_samples).collect();
                     queue.push(AudioBlock {
                         format,
-                        samples: block_samples,
+                        samples,
                         frames: config.block_frames,
                     });
-                    *last_fill = Instant::now();
+                    last_output = Instant::now();
                 }
-                
-                let hr = unsafe { capture_client.GetNextPacketSize() };
-                if hr.is_err() {
-                    tracing::warn!("GetNextPacketSize failed during loop, restarting capture");
-                    break;
+                if last_output.elapsed() >= fill_interval {
+                    // Flush any partial packet before padding the missing frames.
+                    let mut samples: Vec<_> = accum.drain(..).collect();
+                    samples.resize(block_samples, 0.0);
+                    queue.push(AudioBlock {
+                        format,
+                        samples,
+                        frames: config.block_frames,
+                    });
+                    last_output = Instant::now();
                 }
-                packet_frames = hr.unwrap();
             }
-            
-            if restart.load(Ordering::Relaxed) {
-                break;
-            }
+            std::thread::park_timeout(Duration::from_millis(1));
         }
-        
         Ok(())
     }
 
@@ -489,133 +240,264 @@ impl LoopbackCapture {
 impl Drop for LoopbackCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        for join in [&self.join, &self.notification_join].into_iter().flatten() {
+            join.thread().unpark();
         }
-        if let Some(join) = self.notification_join.take() {
-            let _ = join.join();
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum SampleEncoding {
-    Float32,
-    Pcm16,
-    Pcm24Packed,
-    Pcm24In32 { valid_bits: u16 },
-    Pcm32,
-}
-
-unsafe fn parse_format(
-    pwfx: *const WAVEFORMATEX,
-) -> anyhow::Result<(AudioFormat, SampleEncoding, usize)> {
-    let wfex = unsafe { &*pwfx };
-    const WAVE_FORMAT_IEEE_FLOAT: u32 = 3;
-    const WAVE_FORMAT_EXTENSIBLE: u32 = 0xFFFE;
-    let format = AudioFormat {
-        sample_rate: wfex.nSamplesPerSec,
-        channels: wfex.nChannels,
-    };
-    let (encoding, block_align_bytes) = match wfex.wFormatTag as u32 {
-        WAVE_FORMAT_IEEE_FLOAT => {
-            anyhow::ensure!(wfex.wBitsPerSample == 32, "unexpected float bits per sample");
-            (SampleEncoding::Float32, wfex.nBlockAlign as usize)
-        }
-        WAVE_FORMAT_PCM => match wfex.wBitsPerSample {
-            16 => (SampleEncoding::Pcm16, wfex.nBlockAlign as usize),
-            24 => (SampleEncoding::Pcm24Packed, wfex.nBlockAlign as usize),
-            32 => (SampleEncoding::Pcm32, wfex.nBlockAlign as usize),
-            b => anyhow::bail!("unsupported PCM bits per sample: {b}"),
-        },
-        WAVE_FORMAT_EXTENSIBLE => {
-            let wfext = unsafe { &*(pwfx as *const WAVEFORMATEXTENSIBLE) };
-            let valid_bits = unsafe { wfext.Samples.wValidBitsPerSample };
-            let sub = wfext.SubFormat;
-            if sub == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT {
-                anyhow::ensure!(wfex.wBitsPerSample == 32, "unexpected extensible float bits");
-                (SampleEncoding::Float32, wfex.nBlockAlign as usize)
-            } else if sub == KSDATAFORMAT_SUBTYPE_PCM {
-                match wfex.wBitsPerSample {
-                    16 => (SampleEncoding::Pcm16, wfex.nBlockAlign as usize),
-                    24 => {
-                        let bytes_per_sample = wfex.nBlockAlign as usize / wfex.nChannels as usize;
-                        if bytes_per_sample == 3 {
-                            (SampleEncoding::Pcm24Packed, wfex.nBlockAlign as usize)
-                        } else {
-                            (SampleEncoding::Pcm24In32 { valid_bits }, wfex.nBlockAlign as usize)
-                        }
-                    }
-                    32 => (SampleEncoding::Pcm32, wfex.nBlockAlign as usize),
-                    b => anyhow::bail!("unsupported extensible PCM bits per sample: {b}"),
-                }
-            } else {
-                anyhow::bail!("unsupported extensible subformat");
+        for join in [self.join.take(), self.notification_join.take()]
+            .into_iter()
+            .flatten()
+        {
+            if join.join().is_err() {
+                tracing::warn!("audio worker panicked during shutdown");
             }
         }
-        tag => anyhow::bail!("unsupported wFormatTag: {tag}"),
-    };
-    Ok((format, encoding, block_align_bytes))
+    }
 }
 
-unsafe fn decode_samples(
-    data_ptr: *const u8,
-    bytes_len: usize,
-    channels: u16,
+fn device_id(device: &IMMDevice) -> anyhow::Result<String> {
+    let id = unsafe { device.GetId()? };
+    let _allocation = ComAllocation(id.0);
+    Ok(unsafe { id.to_string()? })
+}
+
+fn default_device_ids(mixed: bool) -> anyhow::Result<(Option<String>, Option<String>)> {
+    let enumerator: IMMDeviceEnumerator =
+        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+    let render = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
+        .ok()
+        .and_then(|d| device_id(&d).ok());
+    let mic = if mixed {
+        unsafe { enumerator.GetDefaultAudioEndpoint(eCapture, eConsole) }
+            .ok()
+            .and_then(|d| device_id(&d).ok())
+    } else {
+        None
+    };
+    Ok((render, mic))
+}
+
+// All COM resources are released before the enclosing apartment guard.
+struct CaptureEndpoint {
+    client: IAudioClient,
+    capture: IAudioCaptureClient,
+    format: AudioFormat,
     encoding: SampleEncoding,
-) -> Vec<f32> {
-    let bytes_per_sample = match encoding {
-        SampleEncoding::Float32 => 4,
-        SampleEncoding::Pcm16 => 2,
-        SampleEncoding::Pcm24Packed => 3,
-        SampleEncoding::Pcm24In32 { .. } => 4,
-        SampleEncoding::Pcm32 => 4,
-    };
-    let sample_count = bytes_len / bytes_per_sample;
-    let _frames = sample_count / channels as usize;
-    match encoding {
-        SampleEncoding::Float32 => {
-            let src = unsafe { std::slice::from_raw_parts(data_ptr as *const f32, sample_count) };
-            src.to_vec()
+    block_align: usize,
+}
+
+impl CaptureEndpoint {
+    fn new(
+        client: IAudioClient,
+        format_ptr: *const WAVEFORMATEX,
+        flags: u32,
+        format: AudioFormat,
+        encoding: SampleEncoding,
+        block_align: usize,
+    ) -> anyhow::Result<Self> {
+        unsafe {
+            client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                flags,
+                1_000_000,
+                0,
+                format_ptr,
+                None,
+            )?
+        };
+        let capture = unsafe { client.GetService()? };
+        let endpoint = Self {
+            client,
+            capture,
+            format,
+            encoding,
+            block_align,
+        };
+        unsafe { endpoint.client.Start()? };
+        Ok(endpoint)
+    }
+
+    fn read_available(&self, stop: &AtomicBool, restart: &AtomicBool) -> anyhow::Result<Vec<f32>> {
+        let mut samples = Vec::new();
+        while !stop.load(Ordering::Relaxed)
+            && !restart.load(Ordering::Relaxed)
+            && unsafe { self.capture.GetNextPacketSize()? } > 0
+        {
+            let mut data = std::ptr::null_mut();
+            let mut frames = 0;
+            let mut flags = 0;
+            unsafe {
+                self.capture
+                    .GetBuffer(&mut data, &mut frames, &mut flags, None, None)?
+            };
+            if frames == 0 {
+                break;
+            }
+            let decoded = if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+                Ok(vec![0.0; frames as usize * self.format.channels as usize])
+            } else if data.is_null() {
+                Err(anyhow::anyhow!("capture returned a null non-silent buffer"))
+            } else {
+                Ok(unsafe {
+                    decode_samples(
+                        data,
+                        frames as usize * self.block_align,
+                        self.format.channels,
+                        self.encoding,
+                    )
+                })
+            };
+            // Release even if decoding rejects a packet; propagate device failures
+            // so the session is recreated instead of silently looping on a dead client.
+            unsafe { self.capture.ReleaseBuffer(frames)? };
+            samples.extend(decoded?);
         }
-        SampleEncoding::Pcm16 => {
-            let src = unsafe { std::slice::from_raw_parts(data_ptr as *const i16, sample_count) };
-            src.iter().map(|&v| (v as f32) / 32768.0).collect()
-        }
-        SampleEncoding::Pcm32 => {
-            let src = unsafe { std::slice::from_raw_parts(data_ptr as *const i32, sample_count) };
-            src.iter().map(|&v| (v as f32) / 2147483648.0).collect()
-        }
-        SampleEncoding::Pcm24Packed => unsafe { decode_pcm24_packed(data_ptr, bytes_len) },
-        SampleEncoding::Pcm24In32 { valid_bits } => unsafe { decode_pcm24_in32(data_ptr, sample_count, valid_bits) },
+        Ok(samples)
     }
 }
 
-unsafe fn decode_pcm24_packed(data_ptr: *const u8, bytes_len: usize) -> Vec<f32> {
-    let src = unsafe { std::slice::from_raw_parts(data_ptr, bytes_len) };
-    let mut out = Vec::with_capacity(bytes_len / 3);
-    for chunk in src.chunks_exact(3) {
-        let mut v = (chunk[0] as i32) | ((chunk[1] as i32) << 8) | ((chunk[2] as i32) << 16);
-        if (v & 0x800000) != 0 {
-            v |= !0xFFFFFF;
-        }
-        out.push((v as f32) / 8388608.0);
+impl Drop for CaptureEndpoint {
+    fn drop(&mut self) {
+        let _ = unsafe { self.client.Stop() };
     }
-    out
 }
 
-unsafe fn decode_pcm24_in32(data_ptr: *const u8, sample_count: usize, valid_bits: u16) -> Vec<f32> {
-    let src = unsafe { std::slice::from_raw_parts(data_ptr as *const i32, sample_count) };
-    let shift = 32u16.saturating_sub(valid_bits.min(32));
-    if valid_bits >= 32 {
-        return src.iter().map(|&v| (v as f32) / 2147483648.0).collect();
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires live Windows render and microphone endpoints"]
+    fn live_system_and_mixed_capture_restart() {
+        let _apartment = Apartment::new().unwrap();
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.unwrap();
+        for (name, flow) in [("render", eRender), ("microphone", eCapture)] {
+            let device = unsafe { enumerator.GetDefaultAudioEndpoint(flow, eConsole) }.unwrap();
+            let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }.unwrap();
+            let native = ComAllocation(unsafe { client.GetMixFormat() }.unwrap());
+            println!(
+                "{name} native format: {:?}",
+                unsafe { parse_format(native.0) }.unwrap()
+            );
+        }
+        // Exercise conversion even when the current devices happen to share a
+        // native format. This changes only our stream, not Windows device settings.
+        let converted_format = WAVEFORMATEX {
+            wFormatTag: 3,
+            nChannels: 1,
+            nSamplesPerSec: 44_100,
+            nAvgBytesPerSec: 44_100 * 4,
+            nBlockAlign: 4,
+            wBitsPerSample: 32,
+            cbSize: 0,
+        };
+        let device = unsafe { enumerator.GetDefaultAudioEndpoint(eCapture, eConsole) }.unwrap();
+        let client = unsafe { device.Activate(CLSCTX_ALL, None) }.unwrap();
+        let (format, encoding, align) = unsafe { parse_format(&converted_format) }.unwrap();
+        let converted = CaptureEndpoint::new(
+            client,
+            &converted_format,
+            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+            format,
+            encoding,
+            align,
+        )
+        .unwrap();
+        let stop = AtomicBool::new(false);
+        let start = Instant::now();
+        loop {
+            let samples = converted.read_available(&stop, &stop).unwrap();
+            if !samples.is_empty() {
+                assert!(samples.iter().all(|v| v.is_finite()));
+                println!("microphone conversion to mono 44100 Hz succeeded");
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "conversion produced no packets"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(converted);
+        for mixed in [false, true] {
+            for cycle in 0..2 {
+                let capture = LoopbackCapture::start_default_loopback(LoopbackCaptureConfig {
+                    environment_volume: mixed,
+                    ..Default::default()
+                })
+                .unwrap();
+                let stream = capture.stream();
+                let start = Instant::now();
+                let block = loop {
+                    if let Some(block) = stream.pop_latest() {
+                        break block;
+                    }
+                    assert!(
+                        start.elapsed() < Duration::from_secs(5),
+                        "no audio packets: mixed={mixed}, cycle={cycle}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                assert!(block.format.sample_rate > 0 && block.format.channels > 0);
+                assert_eq!(
+                    block.samples.len(),
+                    block.frames * block.format.channels as usize
+                );
+                assert!(block.samples.iter().all(|sample| sample.is_finite()));
+                println!(
+                    "mixed={mixed}, cycle={cycle}, format={:?}, first_packet_ms={}",
+                    block.format,
+                    start.elapsed().as_millis()
+                );
+                drop(capture);
+            }
+        }
     }
-    let shift = shift as i32;
-    let scale = (1u32 << (valid_bits.max(1) - 1)) as f32;
-    src.iter()
-        .map(|&v| {
-            let v = v >> shift;
-            (v as f32) / scale
-        })
-        .collect()
+
+    #[test]
+    fn invalid_capture_sizes_return_errors_without_spawning() {
+        for config in [
+            LoopbackCaptureConfig {
+                block_frames: 0,
+                ..Default::default()
+            },
+            LoopbackCaptureConfig {
+                queue_capacity: 0,
+                ..Default::default()
+            },
+        ] {
+            assert!(LoopbackCapture::start_default_loopback(config).is_err());
+        }
+    }
+
+    #[test]
+    fn shutdown_wakes_and_joins_waiting_workers() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let joins: Vec<_> = (0..2)
+            .map(|_| {
+                let stop = stop.clone();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    tx.send(()).unwrap();
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::park_timeout(Duration::from_secs(60));
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..2 {
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let mut joins = joins.into_iter();
+        let capture = LoopbackCapture {
+            queue: AudioQueue::new(1),
+            stop,
+            join: joins.next(),
+            notification_join: joins.next(),
+        };
+        let start = Instant::now();
+        drop(capture);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
 }
