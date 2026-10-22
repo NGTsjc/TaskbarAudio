@@ -1,5 +1,6 @@
 use crate::audio;
 use crate::config::UiConfig;
+use crate::util::dpi::DpiScope;
 use crate::util::win32::{get_window_rect, is_valid_shell_tray_wnd};
 use crate::win32::panel_render::PanelRenderer;
 use crate::win32::taskbar_layout::{self, LayoutResult};
@@ -13,6 +14,7 @@ use windows::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, GetClientRect, GetWindowLongPtrW,
     GetParent, IsWindowVisible, KillTimer, PostMessageW, RegisterClassW,
@@ -30,37 +32,43 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const RETRY_TIMER_ID: usize = 1;
 const RENDER_TIMER_ID: usize = 2;
 const WATCHDOG_TIMER_ID: usize = 3;
+const SETTLE_TIMER_ID: usize = 4;
 pub const WM_APP_RETRY_ATTACH: u32 = WM_APP + 1;
+pub const WM_APP_TOGGLE_AUDIO: u32 = WM_APP + 3;
 
 pub fn init(message_hwnd: HWND) -> anyhow::Result<()> {
     unsafe {
         if GetWindowLongPtrW(message_hwnd, GWLP_USERDATA) != 0 {
             return Ok(());
         }
-        let controller = Box::new(TaskbarEmbedController::new()?);
+        let controller = Box::new(TaskbarEmbedController::new());
         let controller = Box::into_raw(controller);
         SetWindowLongPtrW(message_hwnd, GWLP_USERDATA, controller as isize);
     }
-    unsafe {
-        SetTimer(message_hwnd, WATCHDOG_TIMER_ID, UiConfig::WATCHDOG_INTERVAL_MS, None as TIMERPROC);
-    }
-    let attached = attempt_attach(message_hwnd);
-    unsafe {
-        if attached {
-            let _ = KillTimer(message_hwnd, RETRY_TIMER_ID);
-        } else {
-            SetTimer(
-                message_hwnd,
-                RETRY_TIMER_ID,
-                UiConfig::RETRY_ATTACH_INTERVAL_MS,
-                None as TIMERPROC,
-            );
+    if let Some(controller) = unsafe { get_controller_mut(message_hwnd) } {
+        if let Err(error) = controller.resume(message_hwnd) {
+            tracing::warn!(%error, "audio initialization failed; use tray to resume");
         }
     }
     Ok(())
 }
 
 pub fn handle_message(message_hwnd: HWND, msg: u32, wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
+    if msg == WM_APP_TOGGLE_AUDIO {
+        if let Some(controller) = unsafe { get_controller_mut(message_hwnd) } {
+            if controller.paused {
+                if let Err(error) = controller.resume(message_hwnd) {
+                    tracing::warn!(%error, "audio resume failed; remaining paused");
+                }
+            } else {
+                controller.pause(message_hwnd);
+            }
+        }
+        return Some(LRESULT(0));
+    }
+    if is_paused(message_hwnd) && (msg == WM_TIMER || msg == WM_APP_RETRY_ATTACH) {
+        return Some(LRESULT(0));
+    }
     match msg {
         WM_TIMER => {
             if wparam.0 == RETRY_TIMER_ID {
@@ -72,9 +80,12 @@ pub fn handle_message(message_hwnd: HWND, msg: u32, wparam: WPARAM, _lparam: LPA
                 }
                 return Some(LRESULT(0));
             }
-            if wparam.0 == WATCHDOG_TIMER_ID {
+            if wparam.0 == WATCHDOG_TIMER_ID || wparam.0 == SETTLE_TIMER_ID {
                 if let Some(controller) = unsafe { get_controller_mut(message_hwnd) } {
                     controller.watchdog_tick(message_hwnd);
+                    if !controller.pending_show || controller.tray_only {
+                        unsafe { let _ = KillTimer(message_hwnd, SETTLE_TIMER_ID); }
+                    }
                 }
                 return Some(LRESULT(0));
             }
@@ -100,6 +111,10 @@ pub fn handle_message(message_hwnd: HWND, msg: u32, wparam: WPARAM, _lparam: LPA
     }
 }
 
+pub fn is_paused(message_hwnd: HWND) -> bool {
+    unsafe { get_controller_mut(message_hwnd) }.map(|c| c.paused).unwrap_or(true)
+}
+
 pub fn is_tray_only(message_hwnd: HWND) -> bool {
     unsafe { get_controller_mut(message_hwnd) }
         .map(|c| c.is_tray_only())
@@ -115,6 +130,7 @@ pub fn shutdown(message_hwnd: HWND) {
         }
         let _ = KillTimer(message_hwnd, RETRY_TIMER_ID);
         let _ = KillTimer(message_hwnd, WATCHDOG_TIMER_ID);
+        let _ = KillTimer(message_hwnd, SETTLE_TIMER_ID);
     }
 }
 
@@ -126,6 +142,9 @@ pub fn request_retry_attach(message_hwnd: HWND) {
 }
 
 fn attempt_attach(message_hwnd: HWND) -> bool {
+    if is_paused(message_hwnd) {
+        return false;
+    }
     tracing::debug!("attempt_attach called");
     let controller = unsafe { get_controller_mut(message_hwnd) };
     let Some(controller) = controller else {
@@ -133,7 +152,7 @@ fn attempt_attach(message_hwnd: HWND) -> bool {
         return false;
     };
     tracing::debug!("attempt_attach: controller found, calling try_attach");
-    match controller.try_attach() {
+    match controller.try_attach(message_hwnd) {
         Ok(true) => {
             tracing::info!("attempt_attach: taskbar embed attached successfully");
             true
@@ -161,6 +180,8 @@ unsafe fn get_controller_mut(message_hwnd: HWND) -> Option<&'static mut TaskbarE
 }
 
 struct TaskbarEmbedController {
+    paused: bool,
+    capture: Option<audio::LoopbackCapture>,
     panel_hwnd: HWND,
     tray_only: bool,
     last_layout: Option<(i32, i32, i32, i32)>,
@@ -169,7 +190,7 @@ struct TaskbarEmbedController {
     pending_show: bool,
     pending_since: Instant,
     stable_client_ticks: u32,
-    last_shell_client: Option<(i32, i32)>,
+    last_shell_client: Option<(i32, i32, u32)>,
 }
 
 struct PanelWindowState {
@@ -199,10 +220,11 @@ impl PanelRuntimeStats {
 }
 
 impl TaskbarEmbedController {
-    fn new() -> anyhow::Result<Self> {
-        let panel_hwnd = Self::create_panel_window()?;
-        Ok(Self {
-            panel_hwnd,
+    fn new() -> Self {
+        Self {
+            paused: true,
+            capture: None,
+            panel_hwnd: HWND::default(),
             tray_only: true,
             last_layout: None,
             watchdog_recover_count: 0,
@@ -211,10 +233,86 @@ impl TaskbarEmbedController {
             pending_since: Instant::now(),
             stable_client_ticks: 0,
             last_shell_client: None,
-        })
+        }
     }
 
-    fn create_panel_window() -> anyhow::Result<HWND> {
+    fn pause(&mut self, message_hwnd: HWND) {
+        self.paused = true;
+        unsafe {
+            let _ = KillTimer(message_hwnd, WATCHDOG_TIMER_ID);
+            let _ = KillTimer(message_hwnd, SETTLE_TIMER_ID);
+            let _ = KillTimer(message_hwnd, RETRY_TIMER_ID);
+        }
+        self.stop_resources();
+        tracing::info!("audio paused; capture, device polling and rendering stopped");
+    }
+
+    fn stop_resources(&mut self) {
+        let panel = std::mem::take(&mut self.panel_hwnd);
+        if !panel.0.is_null() {
+            unsafe {
+                let _ = DestroyWindow(panel);
+            }
+        }
+        audio::set_global_stream(None);
+        drop(self.capture.take());
+        self.tray_only = true;
+        self.last_layout = None;
+        self.pending_show = false;
+        self.stable_client_ticks = 0;
+        self.last_shell_client = None;
+    }
+
+    fn resume(&mut self, message_hwnd: HWND) -> anyhow::Result<()> {
+        if !self.paused {
+            return Ok(());
+        }
+        let result = (|| -> anyhow::Result<()> {
+            let capture = audio::LoopbackCapture::start_default_loopback(audio::LoopbackCaptureConfig {
+                environment_volume: crate::config::user::get_user_config().environment_volume,
+                ..Default::default()
+            })?;
+            audio::set_global_stream(Some(capture.stream()));
+            self.capture = Some(capture);
+            self.panel_hwnd = Self::create_panel_window(unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }.ok())?;
+            self.paused = false;
+            unsafe {
+                anyhow::ensure!(
+                    SetTimer(message_hwnd, WATCHDOG_TIMER_ID, UiConfig::WATCHDOG_INTERVAL_MS, None as TIMERPROC) != 0,
+                    "watchdog timer creation failed"
+                );
+            }
+            let attached = match self.try_attach(message_hwnd) {
+                Ok(attached) => attached,
+                Err(error) => {
+                    tracing::warn!(%error, "taskbar attach failed; will retry");
+                    false
+                }
+            };
+            if !attached {
+                self.set_tray_only();
+                unsafe {
+                    anyhow::ensure!(
+                        SetTimer(message_hwnd, RETRY_TIMER_ID, UiConfig::RETRY_ATTACH_INTERVAL_MS, None as TIMERPROC) != 0,
+                        "retry timer creation failed"
+                    );
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.pause(message_hwnd);
+        } else {
+            tracing::info!("audio resumed");
+        }
+        result
+    }
+
+    fn create_panel_window(shell: Option<HWND>) -> anyhow::Result<HWND> {
+        let _dpi_scope = match shell {
+            Some(shell) => DpiScope::for_window(shell)?,
+            None => DpiScope::per_monitor()?,
+        };
         unsafe {
             let instance = GetModuleHandleW(None)?;
             let class_name = w!("TaskbarAudioPanel");
@@ -236,7 +334,7 @@ impl TaskbarEmbedController {
                 style,
                 0,
                 0,
-                240,
+                UiConfig::PANEL_WIDTH_PX,
                 40,
                 None,
                 HMENU::default(),
@@ -255,19 +353,19 @@ impl TaskbarEmbedController {
         }
     }
 
-    fn recreate_panel_window(&mut self) -> anyhow::Result<()> {
+    fn recreate_panel_window(&mut self, shell: HWND) -> anyhow::Result<()> {
         unsafe {
             if self.panel_hwnd.0 != std::ptr::null_mut() {
                 let _ = DestroyWindow(self.panel_hwnd);
             }
-            self.panel_hwnd = Self::create_panel_window()?;
+            self.panel_hwnd = Self::create_panel_window(Some(shell))?;
             tracing::info!("recreated panel window: {:p}", self.panel_hwnd.0);
             self.last_layout = None;
             Ok(())
         }
     }
 
-    fn try_attach(&mut self) -> anyhow::Result<bool> {
+    fn try_attach(&mut self, message_hwnd: HWND) -> anyhow::Result<bool> {
         tracing::debug!("try_attach called, panel_hwnd={:p}", self.panel_hwnd.0);
         unsafe {
             if std::env::var_os("TASKBARAUDIO_DISABLE_EMBED").is_some() {
@@ -286,6 +384,7 @@ impl TaskbarEmbedController {
                 return Ok(false);
             }
             tracing::debug!("try_attach: found shell window={:p}", shell.0);
+            let _dpi_scope = DpiScope::for_window(shell)?;
 
             match is_bottom_taskbar(shell) {
                 Ok(true) => tracing::debug!("try_attach: is_bottom_taskbar=true"),
@@ -308,85 +407,76 @@ impl TaskbarEmbedController {
             }
 
             tracing::debug!("try_attach: calling attach_to_shell");
-            let mut recreated = false;
             match self.attach_to_shell(shell) {
                 Ok(()) => {
                     tracing::debug!("try_attach: attach_to_shell succeeded");
                 }
                 Err(e) => {
                     tracing::warn!("try_attach: attach_to_shell failed: {}, attempting to recreate panel window", e);
-                    self.recreate_panel_window()?;
+                    self.recreate_panel_window(shell)?;
                     self.attach_to_shell(shell)?;
-                    recreated = true;
                     tracing::debug!("try_attach: attach_to_shell succeeded after panel recreation");
                 }
             }
 
-            self.tray_only = false;
-            self.pending_show = false;
-            self.pending_since = Instant::now();
-            self.stable_client_ticks = 0;
-            self.last_shell_client = None;
-            
-            if recreated {
-                tracing::debug!("try_attach: showing panel window immediately after recreation");
-                let _ = ShowWindow(self.panel_hwnd, SW_SHOWNOACTIVATE);
-            } else {
-                self.pending_show = true;
-            }
-            
+            self.defer_panel_show(message_hwnd)?;
             tracing::debug!("try_attach: returning true, pending_show={}", self.pending_show);
             Ok(true)
         }
     }
 
-    fn watchdog_tick(&mut self, message_hwnd: HWND) {
-        let Ok(shell) = (unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }) else {
-            if !self.tray_only {
-                tracing::warn!("watchdog: taskbar window disappeared, switching to tray-only");
-                self.set_tray_only();
-                unsafe {
-                    SetTimer(
-                        message_hwnd,
-                        RETRY_TIMER_ID,
-                        UiConfig::RETRY_ATTACH_INTERVAL_MS,
-                        None as TIMERPROC,
-                    );
-                }
-            }
-            return;
-        };
-
-        if shell.0 == std::ptr::null_mut() {
-            if !self.tray_only {
-                tracing::warn!("watchdog: taskbar window is null, switching to tray-only");
-                self.set_tray_only();
-                unsafe {
-                    SetTimer(
-                        message_hwnd,
-                        RETRY_TIMER_ID,
-                        UiConfig::RETRY_ATTACH_INTERVAL_MS,
-                        None as TIMERPROC,
-                    );
-                }
-            }
-            return;
+    fn defer_panel_show(&mut self, message_hwnd: HWND) -> anyhow::Result<()> {
+        self.tray_only = false;
+        self.pending_show = true;
+        self.pending_since = Instant::now();
+        self.stable_client_ticks = 0;
+        self.last_shell_client = None;
+        self.last_layout = None;
+        // Check geometry every 50 ms during attachment; the normal watchdog
+        // remains at 3 seconds and is not on the first-display critical path.
+        unsafe {
+            let _ = ShowWindow(self.panel_hwnd, SW_HIDE);
+            anyhow::ensure!(SetTimer(message_hwnd, SETTLE_TIMER_ID,
+                UiConfig::ATTACH_SETTLE_INTERVAL_MS, None as TIMERPROC) != 0,
+                "settle timer creation failed");
         }
+        Ok(())
+    }
 
-        let Ok(true) = is_bottom_taskbar(shell) else {
-            if !self.tray_only {
-                tracing::warn!("watchdog: bottom taskbar not found, switching to tray-only");
-                self.set_tray_only();
-                unsafe {
-                    SetTimer(
-                        message_hwnd,
-                        RETRY_TIMER_ID,
-                        UiConfig::RETRY_ATTACH_INTERVAL_MS,
-                        None as TIMERPROC,
-                    );
-                }
+    fn show_panel_when_ready(&mut self) {
+        let should_show = self.pending_show && self.last_layout.is_some()
+            && self.stable_client_ticks >= 2
+            && self.pending_since.elapsed() >= Duration::from_millis(100);
+        if should_show {
+            unsafe {
+                let _ = ShowWindow(self.panel_hwnd, SW_SHOWNOACTIVATE);
+                SetTimer(self.panel_hwnd, RENDER_TIMER_ID, UiConfig::RENDER_ACTIVE_INTERVAL_MS, None as TIMERPROC);
+                let _ = InvalidateRect(self.panel_hwnd, None, false);
             }
-            return;
+            if let Some(state) = unsafe { get_panel_state_mut(self.panel_hwnd) } {
+                state.stats.timer_interval_ms = UiConfig::RENDER_ACTIVE_INTERVAL_MS;
+                state.stats.last_active = Instant::now();
+            }
+            self.pending_show = false;
+            self.watchdog_recover_count = self.watchdog_recover_count.saturating_add(1);
+            tracing::debug!(layout = ?self.last_layout, shell_geometry = ?self.last_shell_client,
+                settle_ms = self.pending_since.elapsed().as_millis(), "taskbar panel shown");
+        }
+    }
+
+    fn watchdog_tick(&mut self, message_hwnd: HWND) {
+        let shell = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }.ok();
+        let shell = match shell {
+            Some(shell) if matches!(is_bottom_taskbar(shell), Ok(true)) => shell,
+            _ => {
+                if !self.tray_only {
+                    tracing::warn!("watchdog: bottom taskbar unavailable, switching to tray-only");
+                    self.set_tray_only();
+                    unsafe { SetTimer(message_hwnd, RETRY_TIMER_ID,
+                        UiConfig::RETRY_ATTACH_INTERVAL_MS, None as TIMERPROC); }
+                }
+                return;
+            }
         };
 
         unsafe {
@@ -399,93 +489,73 @@ impl TaskbarEmbedController {
                 } else {
                     tracing::info!("watchdog: parent mismatch detected, attempting reattach");
                 }
-                match self.try_attach() {
-                    Ok(true) => {
-                        tracing::info!("watchdog: successfully reattached to taskbar");
-                        self.watchdog_recover_count = self.watchdog_recover_count.saturating_add(1);
+                let attached = match self.try_attach(message_hwnd) {
+                    Ok(attached) => attached,
+                    Err(error) => {
+                        tracing::warn!(%error, "watchdog: taskbar reattach failed");
+                        false
                     }
-                    Ok(false) => {
-                        tracing::warn!("watchdog: try_attach failed, switching to tray-only");
-                        self.set_tray_only();
-                        SetTimer(
-                            message_hwnd,
-                            RETRY_TIMER_ID,
-                            UiConfig::RETRY_ATTACH_INTERVAL_MS,
-                            None as TIMERPROC,
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!("watchdog: try_attach error={}, switching to tray-only", e);
-                        self.set_tray_only();
-                        SetTimer(
-                            message_hwnd,
-                            RETRY_TIMER_ID,
-                            UiConfig::RETRY_ATTACH_INTERVAL_MS,
-                            None as TIMERPROC,
-                        );
-                        return;
-                    }
+                };
+                if !attached {
+                    self.set_tray_only();
+                    SetTimer(message_hwnd, RETRY_TIMER_ID,
+                        UiConfig::RETRY_ATTACH_INTERVAL_MS, None as TIMERPROC);
+                    return;
                 }
-            }
-        }
-        let mut client = RECT::default();
-        let _ = unsafe { GetClientRect(shell, &mut client) };
-        let client_w = client.right - client.left;
-        let client_h = client.bottom - client.top;
-
-        let layout_result = taskbar_layout::update_layout(shell, self.panel_hwnd, self.last_layout).unwrap_or(LayoutResult::Invalid);
-        if layout_result == LayoutResult::Updated {
-            self.last_layout = Some(taskbar_layout::calculate_layout(shell).unwrap_or((0, 0, 0, 0)));
-            self.layout_update_count = self.layout_update_count.saturating_add(1);
-        }
-        unsafe {
-            if layout_result == LayoutResult::Invalid {
-                self.pending_show = true;
-                self.pending_since = Instant::now();
-                self.stable_client_ticks = 0;
-                self.last_shell_client = None;
-                return;
-            }
-
-            if client_w > 0 && client_h > 0 {
-                if self.last_shell_client == Some((client_w, client_h)) {
-                    self.stable_client_ticks = self.stable_client_ticks.saturating_add(1);
-                } else {
-                    self.stable_client_ticks = 0;
-                    self.last_shell_client = Some((client_w, client_h));
-                }
-            }
-
-            if self.pending_show {
-                let should_show = self.stable_client_ticks >= 2
-                    || self.pending_since.elapsed() >= Duration::from_millis(500);
-                if should_show {
-                    let _ = ShowWindow(self.panel_hwnd, SW_SHOWNOACTIVATE);
-                    self.pending_show = false;
-                    self.watchdog_recover_count = self.watchdog_recover_count.saturating_add(1);
-                }
-                return;
-            }
-
-            if !IsWindowVisible(self.panel_hwnd).as_bool() {
-                let _ = ShowWindow(self.panel_hwnd, SW_SHOWNOACTIVATE);
                 self.watchdog_recover_count = self.watchdog_recover_count.saturating_add(1);
             }
         }
+        if let Err(error) = self.update_panel_layout(shell, message_hwnd) {
+            tracing::warn!(%error, "taskbar panel layout failed");
+        }
+    }
+
+    fn update_panel_layout(&mut self, shell: HWND, message_hwnd: HWND) -> anyhow::Result<()> {
+        let _dpi_scope = DpiScope::for_window(shell)?;
+        let mut client = RECT::default();
+        unsafe { GetClientRect(shell, &mut client)?; }
+        let geometry = (client.right - client.left, client.bottom - client.top,
+            unsafe { GetDpiForWindow(shell) });
+        let result = taskbar_layout::update_layout(shell, self.panel_hwnd, self.last_layout)?;
+        if result == LayoutResult::Invalid {
+            self.defer_panel_show(message_hwnd)?;
+            return Ok(());
+        }
+        if result == LayoutResult::Updated {
+            self.last_layout = Some(taskbar_layout::calculate_layout(shell)?);
+            self.layout_update_count = self.layout_update_count.saturating_add(1);
+        }
+        if self.last_shell_client == Some(geometry) {
+            self.stable_client_ticks = self.stable_client_ticks.saturating_add(1);
+        } else {
+            self.stable_client_ticks = 0;
+            self.last_shell_client = Some(geometry);
+            self.pending_since = Instant::now();
+        }
+        if self.pending_show {
+            self.show_panel_when_ready();
+        } else if !unsafe { IsWindowVisible(self.panel_hwnd) }.as_bool() {
+            unsafe { let _ = ShowWindow(self.panel_hwnd, SW_SHOWNOACTIVATE); }
+        }
+        Ok(())
     }
 
     fn attach_to_shell(&mut self, shell: HWND) -> anyhow::Result<()> {
+        let _dpi_scope = DpiScope::for_window(shell)?;
         unsafe {
-            SetLastError(WIN32_ERROR(0));
-            let _prev = SetParent(self.panel_hwnd, shell);
-            let err = GetLastError();
-            anyhow::ensure!(err.0 == 0, "SetParent failed: {}", err.0);
+            anyhow::ensure!(windows::Win32::UI::HiDpi::AreDpiAwarenessContextsEqual(
+                windows::Win32::UI::HiDpi::GetWindowDpiAwarenessContext(self.panel_hwnd),
+                windows::Win32::UI::HiDpi::GetWindowDpiAwarenessContext(shell),
+            ).as_bool(), "panel DPI context changed; recreate before attaching");
             let old_style = GetWindowLongPtrW(self.panel_hwnd, GWL_STYLE) as u32;
             let mut new_style = WINDOW_STYLE(old_style);
             new_style &= !WS_POPUP;
             new_style |= WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
             SetWindowLongPtrW(self.panel_hwnd, GWL_STYLE, new_style.0 as isize);
+            SetLastError(WIN32_ERROR(0));
+            let _prev = SetParent(self.panel_hwnd, shell);
+            let err = GetLastError();
+            anyhow::ensure!(err.0 == 0, "SetParent failed: {}", err.0);
             let required_ex: WINDOW_EX_STYLE =
                 WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED;
             let old_ex = GetWindowLongPtrW(self.panel_hwnd, GWL_EXSTYLE) as u32;
@@ -515,15 +585,12 @@ impl TaskbarEmbedController {
 
 impl Drop for TaskbarEmbedController {
     fn drop(&mut self) {
-        unsafe {
-            if self.panel_hwnd.0 != std::ptr::null_mut() {
-                let _ = DestroyWindow(self.panel_hwnd);
-            }
-        }
+        self.stop_resources();
     }
 }
 
 fn is_bottom_taskbar(shell: HWND) -> anyhow::Result<bool> {
+    let _dpi_scope = DpiScope::for_window(shell)?;
     unsafe {
         let shell_rect = get_window_rect(shell)?;
         let monitor = MonitorFromWindow(shell, MONITOR_DEFAULTTONEAREST);
@@ -552,15 +619,19 @@ extern "system" fn panel_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 });
                 unsafe {
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
-                    SetTimer(
+                    if SetTimer(
                         hwnd,
                         RENDER_TIMER_ID,
                         UiConfig::RENDER_ACTIVE_INTERVAL_MS,
                         None as TIMERPROC,
-                    );
+                    ) == 0 {
+                        tracing::warn!("render timer creation failed");
+                        return LRESULT(-1);
+                    }
                 }
             } else {
-                tracing::warn!("panel renderer init failed; panel will be blank");
+                tracing::warn!("panel renderer init failed");
+                return LRESULT(-1);
             }
             LRESULT(0)
         }
@@ -694,5 +765,119 @@ fn verify_panel_non_interactive(hwnd: HWND) {
         if ht != HTTRANSPARENT as u32 || ma != MA_NOACTIVATE as u32 {
             tracing::warn!(ht, ma, "panel non-interactive verification failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    extern "system" fn test_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+    }
+
+    #[test]
+    fn pause_resume_releases_and_recreates_runtime() {
+        crate::config::user::load_user_config().unwrap();
+        // Exercise the native controller without requiring an interactive shell/tray.
+        let instance = unsafe { GetModuleHandleW(None) }.unwrap();
+        let hwnd = unsafe {
+            let class_name = w!("TaskbarAudioLifecycleTest");
+            RegisterClassW(&WNDCLASSW {
+                hInstance: instance.into(),
+                lpszClassName: class_name,
+                lpfnWndProc: Some(test_wnd_proc),
+                ..Default::default()
+            });
+            CreateWindowExW(WINDOW_EX_STYLE::default(), class_name, w!(""), WINDOW_STYLE::default(),
+                0, 0, 0, 0, windows::Win32::UI::WindowsAndMessaging::HWND_MESSAGE,
+                HMENU::default(), instance, None).unwrap()
+        };
+        struct TestWindow(HWND);
+        impl Drop for TestWindow {
+            fn drop(&mut self) {
+                shutdown(self.0);
+                unsafe { let _ = DestroyWindow(self.0); }
+            }
+        }
+        let window = TestWindow(hwnd);
+        init(hwnd).unwrap();
+        assert!(!is_paused(hwnd));
+        // A local shell substitute also exercises layout/show without Explorer.
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                hwnd, HWND::default(), 0, 0, 640, 48,
+                windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+            ).unwrap();
+        }
+        assert!(taskbar_layout::update_layout(
+            hwnd, HWND((-42_isize) as *mut _), None,
+        ).is_err());
+        for _ in 0..3 {
+            let controller = unsafe { get_controller_mut(hwnd) }.unwrap();
+            controller.recreate_panel_window(hwnd).unwrap();
+            controller.attach_to_shell(hwnd).unwrap();
+            assert!(unsafe { windows::Win32::UI::HiDpi::AreDpiAwarenessContextsEqual(
+                windows::Win32::UI::HiDpi::GetWindowDpiAwarenessContext(controller.panel_hwnd),
+                windows::Win32::UI::HiDpi::GetWindowDpiAwarenessContext(hwnd),
+            ) }.as_bool());
+            controller.defer_panel_show(hwnd).unwrap();
+            assert!(controller.pending_show);
+            controller.show_panel_when_ready();
+            let style = unsafe { GetWindowLongPtrW(controller.panel_hwnd, GWL_STYLE) } as u32;
+            assert_eq!(style & windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE.0, 0);
+            // First layout starts the stable-geometry window; no early show.
+            controller.update_panel_layout(hwnd, hwnd).unwrap();
+            controller.update_panel_layout(hwnd, hwnd).unwrap();
+            assert!(controller.pending_show);
+            let expected = controller.last_layout.unwrap();
+            controller.pending_since = Instant::now() - Duration::from_millis(150);
+            controller.update_panel_layout(hwnd, hwnd).unwrap();
+            assert!(!controller.pending_show);
+            let style = unsafe { GetWindowLongPtrW(controller.panel_hwnd, GWL_STYLE) } as u32;
+            assert_ne!(style & windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE.0, 0);
+            let mut client = RECT::default();
+            unsafe { GetClientRect(controller.panel_hwnd, &mut client) }.unwrap();
+            assert_eq!((client.right, client.bottom), (expected.2, expected.3));
+            // A cached desired rectangle must not hide an actual position drift.
+            unsafe { windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                controller.panel_hwnd, HWND::default(), expected.0, 20, expected.2, expected.3,
+                windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+            ) }.unwrap();
+            assert_eq!(taskbar_layout::update_layout(hwnd, controller.panel_hwnd, Some(expected)).unwrap(), LayoutResult::Updated);
+            assert_eq!(taskbar_layout::update_layout(hwnd, controller.panel_hwnd, Some(expected)).unwrap(), LayoutResult::Unchanged);
+            let panel = unsafe { get_controller_mut(hwnd) }.unwrap().panel_hwnd;
+            let previous_stream = audio::global_stream().unwrap();
+            audio::set_global_stream(None);
+            assert!(audio::global_stream().is_none());
+            audio::set_global_stream(Some(previous_stream));
+            assert!(audio::global_stream().is_some());
+            unsafe { get_controller_mut(hwnd) }.unwrap().pause(hwnd);
+            unsafe { get_controller_mut(hwnd) }.unwrap().pause(hwnd);
+            assert!(is_paused(hwnd));
+            assert!(audio::global_stream().is_none());
+            assert!(!unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(panel) }.as_bool());
+            assert!(unsafe { get_controller_mut(hwnd) }.unwrap().capture.is_none());
+            assert!(unsafe { KillTimer(hwnd, WATCHDOG_TIMER_ID) }.is_err());
+            assert!(unsafe { KillTimer(hwnd, RETRY_TIMER_ID) }.is_err());
+            assert!(unsafe { KillTimer(hwnd, SETTLE_TIMER_ID) }.is_err());
+            assert!(!attempt_attach(hwnd));
+            handle_message(hwnd, WM_APP_RETRY_ATTACH, WPARAM(0), LPARAM(0));
+            handle_message(hwnd, WM_TIMER, WPARAM(WATCHDOG_TIMER_ID), LPARAM(0));
+            handle_message(hwnd, WM_TIMER, WPARAM(RETRY_TIMER_ID), LPARAM(0));
+            assert!(is_paused(hwnd));
+            assert!(unsafe { get_controller_mut(hwnd) }.unwrap().panel_hwnd.0.is_null());
+            unsafe { get_controller_mut(hwnd) }.unwrap().resume(hwnd).unwrap();
+            let resumed_panel = unsafe { get_controller_mut(hwnd) }.unwrap().panel_hwnd;
+            unsafe { get_controller_mut(hwnd) }.unwrap().resume(hwnd).unwrap();
+            assert_eq!(resumed_panel, unsafe { get_controller_mut(hwnd) }.unwrap().panel_hwnd);
+            assert!(!is_paused(hwnd));
+            assert!(audio::global_stream().is_some());
+        }
+        // Both entry points route through this same toggle message.
+        handle_message(hwnd, WM_APP_TOGGLE_AUDIO, WPARAM(0), LPARAM(0));
+        assert!(is_paused(hwnd));
+        drop(window);
+        assert!(audio::global_stream().is_none());
     }
 }

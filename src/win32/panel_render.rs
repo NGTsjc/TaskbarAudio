@@ -15,7 +15,6 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::Interface;
 
@@ -30,7 +29,6 @@ pub struct PanelRenderer {
     bars: Vec<f32>,
     display_bars: Vec<f32>,
     peak_bars: Vec<f32>,
-    dpi: f32,
     last_energy: f32,
     device_recreate_count: u64,
     anim_start: std::time::Instant,
@@ -42,7 +40,6 @@ impl PanelRenderer {
         let factory: ID2D1Factory =
             unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
         let analyzer = SpectrumAnalyzer::new(SpectrumConfig::default())?;
-        let dpi = window_dpi(hwnd);
         let now = std::time::Instant::now();
         let mut this = Self {
             factory,
@@ -55,7 +52,6 @@ impl PanelRenderer {
             bars: vec![0.0; SpectrumConfig::default().bars],
             display_bars: vec![0.0; SpectrumConfig::default().bars],
             peak_bars: vec![0.0; SpectrumConfig::default().bars],
-            dpi,
             last_energy: 0.0,
             device_recreate_count: 0,
             anim_start: now,
@@ -66,11 +62,12 @@ impl PanelRenderer {
     }
 
     pub fn on_dpi_changed(&mut self, hwnd: HWND) -> anyhow::Result<()> {
-        self.dpi = window_dpi(hwnd);
+        // All layout constants and client sizes are pixels. Keep one drawing
+        // unit equal to one pixel, including after hide/resume at 150% DPI.
         if let Some(rt) = &self.target {
-            unsafe { rt.SetDpi(self.dpi, self.dpi) };
+            unsafe { rt.SetDpi(96.0, 96.0) };
         }
-        Ok(())
+        self.on_size(hwnd)
     }
 
     pub fn on_size(&mut self, hwnd: HWND) -> anyhow::Result<()> {
@@ -176,8 +173,8 @@ impl PanelRenderer {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
                 alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
             },
-            dpiX: self.dpi,
-            dpiY: self.dpi,
+            dpiX: 96.0,
+            dpiY: 96.0,
             usage: D2D1_RENDER_TARGET_USAGE_NONE,
             minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
         };
@@ -292,7 +289,7 @@ impl PanelRenderer {
         let left = UiConfig::CONTENT_PAD_X_PX;
         let right = (size_w - UiConfig::CONTENT_PAD_X_PX).max(left);
         let top = UiConfig::CONTENT_PAD_TOP_PX;
-        let bottom = (size_h - UiConfig::CONTENT_PAD_BOTTOM_PX).max(top) + UiConfig::CONTENT_BOTTOM_FUDGE_PX;
+        let bottom = (size_h - UiConfig::CONTENT_PAD_BOTTOM_PX).max(top);
         let inner_h = (bottom - top).max(1.0);
         let t = self.anim_start.elapsed().as_secs_f32();
         let shimmer = (t * UiConfig::GRADIENT_SHIMMER_SPEED) % 1.0;
@@ -362,7 +359,7 @@ impl PanelRenderer {
         let left = UiConfig::CONTENT_PAD_X_PX;
         let right = (size_w - UiConfig::CONTENT_PAD_X_PX).max(left);
         let top = UiConfig::CONTENT_PAD_TOP_PX;
-        let bottom = (size_h - UiConfig::CONTENT_PAD_BOTTOM_PX).max(top) + UiConfig::CONTENT_BOTTOM_FUDGE_PX;
+        let bottom = (size_h - UiConfig::CONTENT_PAD_BOTTOM_PX).max(top);
         let inner_h = (bottom - top).max(1.0);
         let inner_w = (right - left).max(1.0);
         let t = self.anim_start.elapsed().as_secs_f32();
@@ -396,11 +393,6 @@ impl PanelRenderer {
     }
 }
 
-fn window_dpi(hwnd: HWND) -> f32 {
-    let dpi = unsafe { GetDpiForWindow(hwnd) };
-    if dpi == 0 { 96.0 } else { dpi as f32 }
-}
-
 fn client_size_u(hwnd: HWND) -> anyhow::Result<D2D_SIZE_U> {
     unsafe {
         let mut rc = RECT::default();
@@ -414,3 +406,7 @@ fn client_size_u(hwnd: HWND) -> anyhow::Result<D2D_SIZE_U> {
 fn color_rgba(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
+
+#[cfg(test)]
+#[path = "panel_render_tests.rs"]
+mod tests;

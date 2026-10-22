@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::config::UiConfig;
-use crate::win32::{taskbar_embed, tray};
+use crate::win32::{hotkey, taskbar_embed, tray};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Console::{
     SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
@@ -9,12 +9,14 @@ use windows::Win32::System::Console::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    PostMessageW, PostQuitMessage, RegisterClassW, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    HMENU, HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WNDCLASSW,
+    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, TranslateMessage, IsWindow,
+    CS_HREDRAW, CS_VREDRAW,
+    HMENU, MSG, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WNDCLASSW,
 };
 use windows::core::w;
 
 static EXIT_HWND_ADDR: OnceLock<isize> = OnceLock::new();
+static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 pub const WM_APP_RESTART: u32 = WM_APP + 10;
@@ -46,17 +48,20 @@ impl MessageLoop {
                 0,
                 0,
                 0,
-                HWND_MESSAGE,
+                None,
                 HMENU::default(),
                 instance,
                 None,
             )?;
             anyhow::ensure!(hwnd.0 != std::ptr::null_mut(), "CreateWindowExW failed");
             let _ = EXIT_HWND_ADDR.set(hwnd.0 as isize);
+            let loop_ = Self { hwnd };
             setup_console_ctrl_handler()?;
-            taskbar_embed::init(hwnd)?;
+            TASKBAR_CREATED.get_or_init(|| RegisterWindowMessageW(w!("TaskbarCreated")));
             tray::init(hwnd)?;
-            Ok(Self { hwnd })
+            taskbar_embed::init(hwnd)?;
+            hotkey::register(hwnd, crate::config::user::get_user_config().toggle_hotkey.as_deref());
+            Ok(loop_)
         }
     }
 
@@ -90,13 +95,19 @@ pub fn take_restart_requested() -> bool {
 
 impl Drop for MessageLoop {
     fn drop(&mut self) {
-        if self.hwnd.0 != std::ptr::null_mut() {
+        if unsafe { IsWindow(self.hwnd) }.as_bool() {
             let _ = unsafe { DestroyWindow(self.hwnd) };
         }
     }
 }
 
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if TASKBAR_CREATED.get().is_some_and(|id| *id != 0 && msg == *id) {
+        if let Err(error) = tray::init(hwnd) {
+            tracing::warn!(%error, "restore tray icon failed");
+        }
+        return LRESULT(0);
+    }
     if let Some(result) = tray::handle_message(hwnd, msg, wparam, lparam) {
         return result;
     }
@@ -104,6 +115,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         return result;
     }
     match msg {
+        WM_HOTKEY if wparam.0 == hotkey::TOGGLE_HOTKEY_ID as usize => {
+            unsafe {
+                let _ = PostMessageW(hwnd, taskbar_embed::WM_APP_TOGGLE_AUDIO, WPARAM(0), LPARAM(0));
+            }
+            LRESULT(0)
+        }
         WM_APP_RESTART => {
             RESTART_REQUESTED.store(true, Ordering::Relaxed);
             unsafe {
@@ -118,6 +135,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             LRESULT(0)
         }
         WM_DESTROY => {
+            hotkey::unregister(hwnd);
             tray::shutdown(hwnd);
             taskbar_embed::shutdown(hwnd);
             unsafe { PostQuitMessage(0) };

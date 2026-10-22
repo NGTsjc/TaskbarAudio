@@ -11,7 +11,6 @@ mod win32;
 
 use crate::single_instance::SingleInstanceGuard;
 use crate::win32::message_loop::MessageLoop;
-use crate::audio::{LoopbackCapture, LoopbackCaptureConfig};
 use crate::util::mmsystem::HighResTimerGuard;
 
 fn main() {
@@ -33,12 +32,6 @@ fn run() -> anyhow::Result<()> {
         if let Err(err) = autostart::ensure_auto_start(user_config.auto_start) {
             tracing::warn!(error = %err, enabled = user_config.auto_start, "sync auto start failed");
         }
-        let loopback = LoopbackCapture::start_default_loopback(LoopbackCaptureConfig {
-            environment_volume: user_config.environment_volume,
-            ..Default::default()
-        })?;
-        let _ = audio::set_global_stream(loopback.stream());
-        let _loopback = loopback;
         let loop_ = MessageLoop::new()?;
         tracing::info!(version = env!("CARGO_PKG_VERSION"), "app started");
         loop_.run()?;

@@ -4,9 +4,10 @@ use std::sync::OnceLock;
 pub struct UiConfigConst;
 
 impl UiConfigConst {
-    pub const PANEL_WIDTH_PX: i32 = 240;
+    pub const PANEL_WIDTH_PX: i32 = 320;
     pub const COLORKEY_FUCHSIA_RGB: u32 = 0x00FF00FF;
     pub const WATCHDOG_INTERVAL_MS: u32 = 3000;
+    pub const ATTACH_SETTLE_INTERVAL_MS: u32 = 50;
     pub const RETRY_ATTACH_INTERVAL_MS: u32 = 3000;
     pub const RENDER_ACTIVE_INTERVAL_MS: u32 = 16;
     pub const RENDER_IDLE_INTERVAL_MS: u32 = 120;
@@ -22,7 +23,6 @@ impl UiConfigConst {
     pub const CONTENT_PAD_X_PX: f32 = 6.0;
     pub const CONTENT_PAD_TOP_PX: f32 = 0.0;
     pub const CONTENT_PAD_BOTTOM_PX: f32 = 0.0;
-    pub const CONTENT_BOTTOM_FUDGE_PX: f32 = 8.0;
     pub const MIN_BAR_HEIGHT_PX: f32 = 3.0;
     pub const PEAK_HEIGHT_PX: f32 = 2.0;
     pub const PEAK_GAP_PX: f32 = 1.0;
@@ -96,6 +96,8 @@ pub struct UserConfig {
     pub offset_x: i32,
     pub environment_volume: bool,
     pub auto_start: bool,
+    #[serde(deserialize_with = "deserialize_toggle_hotkey")]
+    pub toggle_hotkey: Option<String>,
 }
 
 impl Default for UserConfig {
@@ -106,6 +108,7 @@ impl Default for UserConfig {
             offset_x: 0,
             environment_volume: false,
             auto_start: false,
+            toggle_hotkey: None,
         }
     }
 }
@@ -220,7 +223,7 @@ pub struct SpectrumDefaults;
 
 impl SpectrumDefaults {
     pub const FFT_SIZE: usize = 1024;
-    pub const BARS: usize = 64;
+    pub const BARS: usize = 50;
     pub const MIN_HZ: f32 = 40.0;
     pub const MAX_HZ: f32 = 16_000.0;
     pub const UPDATE_HZ: f32 = 60.0;
@@ -280,5 +283,39 @@ pub mod user {
             tracing::debug!(path = %config_path.display(), "user config not found, using defaults");
             Ok(UserConfig::default())
         }
+    }
+}
+
+fn deserialize_toggle_hotkey<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(value) => Ok(Some(value)),
+        _ => {
+            tracing::warn!("toggle_hotkey must be a string or null; ignoring");
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod hotkey_config_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_hotkey_types_do_not_discard_other_settings() {
+        for value in [serde_json::json!(12), serde_json::json!(true), serde_json::json!([]), serde_json::json!({}), serde_json::Value::Null] {
+            let config: UserConfig = serde_json::from_value(serde_json::json!({"position": "left", "toggle_hotkey": value})).unwrap();
+            assert_eq!(config.position, "left");
+            assert!(config.toggle_hotkey.is_none());
+        }
+        let config: UserConfig = serde_json::from_str(r#"{"toggle_hotkey":"Ctrl+Alt+V"}"#).unwrap();
+        assert_eq!(config.toggle_hotkey.as_deref(), Some("Ctrl+Alt+V"));
+        assert!(serde_json::from_str::<UserConfig>("{}").unwrap().toggle_hotkey.is_none());
+        let nested: AppConfig = serde_json::from_str(
+            r#"{"user":{"position":"right","toggle_hotkey":"Ctrl+Alt+V"}}"#,
+        ).unwrap();
+        assert_eq!(nested.user.position, "right");
+        assert_eq!(nested.user.toggle_hotkey, config.toggle_hotkey);
     }
 }

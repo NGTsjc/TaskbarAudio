@@ -18,6 +18,7 @@ const WM_APP_TRAY: u32 = WM_APP + 2;
 const IDM_EXIT: u32 = 1001;
 const IDM_RETRY_ATTACH: u32 = 1002;
 const IDM_RESTART: u32 = 1003;
+const IDM_TOGGLE_AUDIO: u32 = 1004;
 
 pub fn init(message_hwnd: HWND) -> anyhow::Result<()> {
     unsafe {
@@ -49,7 +50,11 @@ pub fn handle_message(message_hwnd: HWND, msg: u32, _wparam: WPARAM, lparam: LPA
             Some(LRESULT(0))
         }
         WM_LBUTTONDBLCLK => {
-            if taskbar_embed::is_tray_only(message_hwnd) {
+            if taskbar_embed::is_paused(message_hwnd) {
+                unsafe {
+                    let _ = PostMessageW(message_hwnd, taskbar_embed::WM_APP_TOGGLE_AUDIO, WPARAM(0), LPARAM(0));
+                }
+            } else if taskbar_embed::is_tray_only(message_hwnd) {
                 unsafe {
                     let _ = PostMessageW(message_hwnd, taskbar_embed::WM_APP_RETRY_ATTACH, WPARAM(0), LPARAM(0));
                 }
@@ -63,7 +68,10 @@ pub fn handle_message(message_hwnd: HWND, msg: u32, _wparam: WPARAM, lparam: LPA
 fn show_context_menu(message_hwnd: HWND) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
-        if taskbar_embed::is_tray_only(message_hwnd) {
+        let paused = taskbar_embed::is_paused(message_hwnd);
+        let label = if paused { w!("显示音频") } else { w!("隐藏音频") };
+        let _ = AppendMenuW(menu, MF_STRING, IDM_TOGGLE_AUDIO as usize, label);
+        if !paused && taskbar_embed::is_tray_only(message_hwnd) {
             let _ = AppendMenuW(menu, MF_STRING, IDM_RETRY_ATTACH as usize, w!("重试附加"));
         }
         let _ = AppendMenuW(menu, MF_STRING, IDM_RESTART as usize, w!("重启"));
@@ -81,6 +89,9 @@ fn show_context_menu(message_hwnd: HWND) {
             None,
         );
         match cmd.0 as u32 {
+            IDM_TOGGLE_AUDIO => {
+                let _ = PostMessageW(message_hwnd, taskbar_embed::WM_APP_TOGGLE_AUDIO, WPARAM(0), LPARAM(0));
+            }
             IDM_EXIT => {
                 let _ = PostMessageW(message_hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
             }
