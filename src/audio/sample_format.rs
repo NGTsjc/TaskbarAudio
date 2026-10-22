@@ -111,19 +111,25 @@ pub(super) unsafe fn decode_samples(
     let bytes = unsafe { std::slice::from_raw_parts(data_ptr, bytes_len) };
     match encoding {
         SampleEncoding::Float32 => bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| {
-                let v = f32::from_le_bytes(b.try_into().unwrap());
+                let v = f32::from_le_bytes(*b);
                 if v.is_finite() { v } else { 0.0 }
             })
             .collect(),
         SampleEncoding::Pcm16 => bytes
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes(b.try_into().unwrap()) as f32 / 32768.0)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
             .collect(),
         SampleEncoding::Pcm32 => bytes
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as f32 / 2147483648.0)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| i32::from_le_bytes(*b) as f32 / 2147483648.0)
             .collect(),
         SampleEncoding::Pcm24Packed => unsafe { decode_pcm24_packed(data_ptr, bytes_len) },
         SampleEncoding::Pcm24In32 { valid_bits } => unsafe {
@@ -135,7 +141,7 @@ pub(super) unsafe fn decode_samples(
 unsafe fn decode_pcm24_packed(data_ptr: *const u8, bytes_len: usize) -> Vec<f32> {
     let src = unsafe { std::slice::from_raw_parts(data_ptr, bytes_len) };
     let mut out = Vec::with_capacity(bytes_len / 3);
-    for chunk in src.chunks_exact(3) {
+    for chunk in src.as_chunks::<3>().0 {
         let mut v = (chunk[0] as i32) | ((chunk[1] as i32) << 8) | ((chunk[2] as i32) << 16);
         if (v & 0x800000) != 0 {
             v |= !0xFFFFFF;
@@ -148,8 +154,10 @@ unsafe fn decode_pcm24_packed(data_ptr: *const u8, bytes_len: usize) -> Vec<f32>
 unsafe fn decode_pcm24_in32(data_ptr: *const u8, sample_count: usize, valid_bits: u16) -> Vec<f32> {
     let bytes = unsafe { std::slice::from_raw_parts(data_ptr, sample_count * 4) };
     let src = bytes
-        .chunks_exact(4)
-        .map(|b| i32::from_le_bytes(b.try_into().unwrap()));
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| i32::from_le_bytes(*b));
     let shift = 32u16.saturating_sub(valid_bits.min(32));
     if valid_bits >= 32 {
         return src.map(|v| (v as f32) / 2147483648.0).collect();
