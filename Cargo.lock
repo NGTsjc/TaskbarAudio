@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "taskbar_audio"
-version = "1.1.8"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",

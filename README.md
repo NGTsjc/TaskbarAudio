@@ -27,6 +27,9 @@ before creating a tag release, and checks normal `master` pushes and pull reques
 
 ## Development checks
 
+CI installs the latest stable Rust/Clippy. Run `rustup update stable` before
+checking locally to avoid differences in lint rules between toolchain versions.
+
 ```powershell
 cargo test --offline
 cargo clippy --offline --all-targets -- -D warnings
@@ -85,6 +88,30 @@ Shortcuts are case-insensitive and allow whitespace around `+`. Use one or more 
 - `Space`, `Tab`, `Enter`, `Escape`, `Backspace`, `Delete`, `Insert`, `Home`, `End`, `PageUp`, `PageDown`, `Left`, `Right`, `Up`, `Down`.
 
 Single keys, duplicate modifiers, empty parts, unknown keys, and multiple main keys are rejected. Invalid values (including incorrect JSON value types) disable only the shortcut. Shortcuts already occupied or rejected by Windows are ignored with a warning; tray controls continue working. Holding the shortcut does not repeatedly toggle the visualizer.
+
+## Application icon
+
+`asset/logo.ico` is embedded into the executable as `MAINICON` and is also used
+by the tray. It combines the audio waveform with a smaller personal mark on a
+transparent background, with eight sizes from 16 to 256 pixels.
+
+After replacing it, run `cargo build --release --locked` and distribute the
+rebuilt `target/release/taskbar_audio.exe`. Existing GitHub release archives keep
+their original icon; publishing the new icon requires committing the change and
+pushing a new version tag. Updating the PowerShell `$tag` variable alone does not
+change the package version in `Cargo.toml`.
+
+### Explorer still shows the old icon
+
+If the tray and Task Manager show the new icon but File Explorer shows the old
+one, refresh the Windows icon cache and reopen the folder:
+
+```powershell
+ie4uinit.exe -show
+```
+
+If necessary, restart **Windows Explorer** from Task Manager or follow Microsoft's
+[icon cache rebuilding instructions](https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/application-shortcuts-show-blank-icons).
 
 ## License
 
