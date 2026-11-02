@@ -54,6 +54,8 @@ pub struct UserConfig {
     pub auto_start: bool,
     #[serde(deserialize_with = "deserialize_toggle_hotkey")]
     pub toggle_hotkey: Option<String>,
+    #[serde(deserialize_with = "deserialize_language_file")]
+    pub language_file: Option<String>,
 }
 
 impl Default for UserConfig {
@@ -65,6 +67,7 @@ impl Default for UserConfig {
             environment_volume: false,
             auto_start: false,
             toggle_hotkey: None,
+            language_file: None,
         }
     }
 }
@@ -165,9 +168,45 @@ fn deserialize_toggle_hotkey<'de, D: serde::Deserializer<'de>>(
     }
 }
 
+fn deserialize_language_file<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(path) => Ok(Some(path)),
+        _ => {
+            tracing::warn!("language_file must be a string or null; using English UI text");
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod hotkey_config_tests {
     use super::*;
+
+    #[test]
+    fn language_file_is_optional_and_tolerant_in_flat_and_nested_config() {
+        assert!(parse_user_config("{}").unwrap().language_file.is_none());
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(123),
+            serde_json::json!(true),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(""),
+            serde_json::json!("locale.json"),
+        ] {
+            let expected = value.as_str().map(str::to_owned);
+            let user = serde_json::json!({"language_file": value, "position": "right", "toggle_hotkey": "Ctrl+Alt+V"});
+            for content in [user.clone(), serde_json::json!({"user": user})] {
+                let config = parse_user_config(&content.to_string()).unwrap();
+                assert_eq!(config.position, "right");
+                assert_eq!(config.toggle_hotkey.as_deref(), Some("Ctrl+Alt+V"));
+                assert_eq!(config.language_file, expected);
+            }
+        }
+    }
 
     #[test]
     fn invalid_hotkey_types_do_not_discard_other_settings() {

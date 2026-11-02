@@ -46,6 +46,7 @@ jobs:
         run: |
           copy target\release\taskbar_audio.exe release\
           copy asset\config.json release\
+          copy asset\locale.example.json release\
 
       - name: Zip release
         run: |

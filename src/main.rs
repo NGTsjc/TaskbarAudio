@@ -4,6 +4,7 @@ mod audio;
 mod autostart;
 mod config;
 mod logging;
+mod localization;
 mod single_instance;
 mod util;
 mod win32;
@@ -24,6 +25,7 @@ fn run() -> anyhow::Result<()> {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "app boot");
     config::user::load_user_config()?;
     let user_config = config::user::get_user_config();
+    localization::init(user_config.language_file.as_deref());
     let should_restart = {
         let _instance = SingleInstanceGuard::acquire("Local\\TaskbarAudio_SingleInstance")?;
         if let Err(err) = autostart::ensure_auto_start(user_config.auto_start) {

@@ -2,6 +2,11 @@
 
 A Windows taskbar audio visualizer component.
 
+The application interface defaults to English and supports custom menu text
+through an optional JSON language file. The tray tooltip and window title are
+`TaskbarAudio`. Application logs and error messages are in English; error
+descriptions returned by Windows may use the system language.
+
 ## Features
 
 - Real-time audio visualization in the taskbar
@@ -57,7 +62,8 @@ Create a `config.json` file in the same directory as the executable:
     "offset_x": 0,
     "environment_volume": false,
     "auto_start": false,
-    "toggle_hotkey": ""
+    "toggle_hotkey": "",
+    "language_file": ""
 }
 ```
 
@@ -69,16 +75,48 @@ Create a `config.json` file in the same directory as the executable:
 - `environment_volume`: Enable mixed audio capture (system + microphone). Windows converts microphone audio to the system audio format before mixing. Changes to either default device restart capture.
 - `auto_start`: Enable Windows auto start via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 - `toggle_hotkey`: Optional global shortcut, for example `"Ctrl+Alt+V"`. Omit it, use `null`, or leave it empty to disable. Configuration changes take effect after restart. Both flat configuration and options nested inside `"user"` are supported.
+- `language_file`: Optional JSON file with custom tray menu labels, for example `"locale.json"`. Relative paths are resolved from the executable directory; absolute paths are also accepted. Omit it, use `null`, or leave it blank for built-in English. Changes take effect after restart.
 
 UTF-8 files with or without a BOM are supported. Malformed JSON or invalid option
-types fall back to defaults with a warning; an invalid `toggle_hotkey` value only
-disables the shortcut and preserves the other options.
+types fall back to defaults with a warning. An invalid `toggle_hotkey` value only
+disables the shortcut; an invalid `language_file` type only disables custom text.
+Both preserve the other options.
+
+### Custom UI text
+
+Place a `locale.json` next to the executable, then set `"language_file": "locale.json"`
+in `config.json` (or inside its `"user"` object). For example:
+
+```json
+{
+    "show_visualizer": "Afficher la visualisation",
+    "hide_visualizer": "Masquer la visualisation",
+    "retry_taskbar_attachment": "Réessayer l'intégration",
+    "restart": "Redémarrer",
+    "exit": "Quitter"
+}
+```
+
+Release archives also include `locale.example.json`, a Chinese translation that
+can be copied to `locale.json` and edited. The sample is not enabled by default.
+
+Only the labels you provide are overridden. Missing, blank, incorrectly typed,
+or control-character-containing labels fall back individually to English.
+Unknown keys are ignored, and ampersands are displayed literally. Use UTF-8 with
+or without a BOM and a JSON object at the root. An unreadable or invalid file
+logs a warning and falls back to English without preventing startup. Restart
+the app after editing the language file. Logs, configuration keys, and the
+`TaskbarAudio` brand name are not translated.
 
 ### Hide, pause, and resume
 
-The visualizer starts enabled on every launch. Press the configured shortcut or select **隐藏音频** (Hide audio) in the tray menu to pause it. Pausing stops audio capture (including the microphone in mixed mode), device polling, spectrum analysis, rendering, and taskbar maintenance timers. Only the tray, shortcut, and Windows message loop remain active.
+The visualizer starts enabled on every launch. Press the configured shortcut or select **Hide Visualizer** in the tray menu to pause it. Pausing stops audio capture (including the microphone in mixed mode), device polling, spectrum analysis, rendering, and taskbar maintenance timers. Only the tray, shortcut, and Windows message loop remain active.
 
-Press the shortcut again, select **显示音频** (Show audio), or double-click the tray icon while paused to resume. Resume recreates the visualizer using the current default audio devices. If the taskbar is unavailable, attachment retries continue until it becomes available. Visibility is not saved between launches. Startup and resume check taskbar geometry every 50 ms and show the panel after it has remained stable for at least 100 ms. The panel width is calculated from the bar count, with 5-pixel columns, 2-pixel gaps, and 6-pixel padding on each side.
+Press the shortcut again, select **Show Visualizer**, or double-click the tray icon while paused to resume. Resume recreates the visualizer using the current default audio devices. If the taskbar is unavailable, attachment retries continue until it becomes available. Visibility is not saved between launches. Startup and resume check taskbar geometry every 50 ms and show the panel after it has remained stable for at least 100 ms. The panel width is calculated from the bar count, with 5-pixel columns, 2-pixel gaps, and 6-pixel padding on each side.
+
+The tray menu offers **Hide Visualizer** while running and **Show Visualizer**
+while paused. **Retry Taskbar Attachment** is available only while running with
+taskbar attachment unavailable. **Restart** and **Exit** are always available.
 
 ### Shortcut rules
 
