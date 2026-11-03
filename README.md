@@ -2,6 +2,8 @@
 
 A Windows taskbar audio visualizer component.
 
+![TaskbarAudio displaying an audio spectrum in the Windows taskbar](asset/screenshot.png)
+
 The application interface defaults to English and supports custom menu text
 through an optional JSON language file. The tray tooltip and window title are
 `TaskbarAudio`. Application logs and error messages are in English; error
