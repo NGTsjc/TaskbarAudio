@@ -56,6 +56,7 @@ pub struct UserConfig {
     pub toggle_hotkey: Option<String>,
     #[serde(deserialize_with = "deserialize_language_file")]
     pub language_file: Option<String>,
+    pub visualization: crate::visualization::VisualizationConfig,
 }
 
 impl Default for UserConfig {
@@ -68,6 +69,7 @@ impl Default for UserConfig {
             auto_start: false,
             toggle_hotkey: None,
             language_file: None,
+            visualization: Default::default(),
         }
     }
 }
@@ -80,15 +82,15 @@ impl SpectrumDefaults {
     pub const MIN_HZ: f32 = 40.0;
     pub const MAX_HZ: f32 = 16_000.0;
     pub const UPDATE_HZ: f32 = 60.0;
-    pub const ATTACK_MS: f32 = 30.0;
-    pub const RELEASE_MS: f32 = 220.0;
+    pub const ATTACK_MS: f32 = 15.0;
+    pub const RELEASE_MS: f32 = 100.0;
     pub const GAMMA: f32 = 0.55;
     pub const NOISE_FLOOR: f32 = 0.0;
-    pub const BAR_GAIN: f32 = 3.10;
+    pub const BAR_GAIN: f32 = 3.60;
     pub const BAR_POW: f32 = 0.50;
-    pub const VIS_ATTACK_MS: f32 = 45.0;
-    pub const VIS_RELEASE_MS: f32 = 140.0;
-    pub const PEAK_FALL_PER_SEC: f32 = 1.35;
+    pub const VIS_ATTACK_MS: f32 = 20.0;
+    pub const VIS_RELEASE_MS: f32 = 65.0;
+    pub const PEAK_FALL_PER_SEC: f32 = 2.0;
     pub const COLOR_GLOW_BASE: f32 = 0.78;
     pub const COLOR_GLOW_RANGE: f32 = 0.22;
     pub const SILENT_DECAY: f32 = 0.985;
@@ -184,6 +186,31 @@ fn deserialize_language_file<'de, D: serde::Deserializer<'de>>(
 #[cfg(test)]
 mod hotkey_config_tests {
     use super::*;
+
+    #[test]
+    fn visualization_supports_old_flat_nested_and_invalid_config() {
+        assert_eq!(
+            parse_user_config("{}").unwrap().visualization,
+            Default::default()
+        );
+        for user in [
+            serde_json::json!({"position":"left","visualization":{"bar_gain":4,"release_ms":80}}),
+            serde_json::json!({"position":"left","visualization":false}),
+        ] {
+            for content in [user.clone(), serde_json::json!({"user": user.clone()})] {
+                let config = parse_user_config(&content.to_string()).unwrap();
+                assert_eq!(config.position, "left");
+                assert_eq!(
+                    config.visualization.bar_gain,
+                    if user["visualization"].is_object() {
+                        4.0
+                    } else {
+                        3.6
+                    }
+                );
+            }
+        }
+    }
 
     #[test]
     fn language_file_is_optional_and_tolerant_in_flat_and_nested_config() {

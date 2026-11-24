@@ -4,7 +4,7 @@ mod mixer;
 mod queue;
 mod sample_format;
 mod spectrum;
-mod types;
+pub(crate) mod types;
 
 pub use loopback::{AudioStream, LoopbackCapture, LoopbackCaptureConfig};
 pub use spectrum::{SpectrumAnalyzer, SpectrumConfig, SpectrumFrame};

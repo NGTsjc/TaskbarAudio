@@ -17,6 +17,7 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::Interface;
+use crate::visualization::VisualizationConfig;
 
 pub struct PanelRenderer {
     factory: ID2D1Factory,
@@ -26,6 +27,7 @@ pub struct PanelRenderer {
     peak_brush: Option<ID2D1SolidColorBrush>,
     grad_stops: Option<ID2D1GradientStopCollection>,
     analyzer: SpectrumAnalyzer,
+    visualization: VisualizationConfig,
     bars: Vec<f32>,
     display_bars: Vec<f32>,
     peak_bars: Vec<f32>,
@@ -37,9 +39,13 @@ pub struct PanelRenderer {
 
 impl PanelRenderer {
     pub fn new(hwnd: HWND) -> anyhow::Result<Self> {
+        Self::new_with_visualization(hwnd, get_user_config().visualization)
+    }
+
+    fn new_with_visualization(hwnd: HWND, visualization: VisualizationConfig) -> anyhow::Result<Self> {
         let factory: ID2D1Factory =
             unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
-        let analyzer = SpectrumAnalyzer::new(SpectrumConfig::default())?;
+        let analyzer = SpectrumAnalyzer::new(visualization.spectrum_config())?;
         let now = std::time::Instant::now();
         let mut this = Self {
             factory,
@@ -49,6 +55,7 @@ impl PanelRenderer {
             peak_brush: None,
             grad_stops: None,
             analyzer,
+            visualization,
             bars: vec![0.0; SpectrumConfig::default().bars],
             display_bars: vec![0.0; SpectrumConfig::default().bars],
             peak_bars: vec![0.0; SpectrumConfig::default().bars],
@@ -259,31 +266,7 @@ impl PanelRenderer {
         let now = std::time::Instant::now();
         let dt = (now - self.last_anim_tick).as_secs_f32().clamp(0.0, 0.25);
         self.last_anim_tick = now;
-        if self.display_bars.len() != self.bars.len() {
-            self.display_bars.resize(self.bars.len(), 0.0);
-            self.peak_bars.resize(self.bars.len(), 0.0);
-        }
-        let attack_tau = (SpectrumDefaults::VIS_ATTACK_MS / 1000.0).max(1e-3);
-        let release_tau = (SpectrumDefaults::VIS_RELEASE_MS / 1000.0).max(1e-3);
-        let a_up = 1.0 - (-dt / attack_tau).exp();
-        let a_dn = 1.0 - (-dt / release_tau).exp();
-        for i in 0..self.bars.len() {
-            let target = self.bars[i].clamp(0.0, 1.0);
-            let cur = self.display_bars[i];
-            let next = if target > cur {
-                cur + (target - cur) * a_up
-            } else {
-                cur + (target - cur) * a_dn
-            };
-            self.display_bars[i] = next;
-            let peak = self.peak_bars[i];
-            let peak_next = if next > peak {
-                next
-            } else {
-                (peak - SpectrumDefaults::PEAK_FALL_PER_SEC * dt).max(next)
-            };
-            self.peak_bars[i] = peak_next;
-        }
+        self.visualization.animate(&self.bars, &mut self.display_bars, &mut self.peak_bars, dt);
     }
 
     fn draw_bars(&mut self, rt: &ID2D1RenderTarget, client_size: D2D_SIZE_U) {
@@ -330,9 +313,7 @@ impl PanelRenderer {
                 let x1_i = (x0_i + bar_w_i + extra).min(right_i);
                 let x0 = x0_i as f32;
                 let x1 = x1_i as f32;
-                let v = (v * SpectrumDefaults::BAR_GAIN)
-                    .clamp(0.0, 1.0)
-                    .powf(SpectrumDefaults::BAR_POW);
+                let v = self.visualization.height(v);
                 let h = (v * inner_h).max(UiConfig::MIN_BAR_HEIGHT_PX);
                 let y0 = (bottom - h).max(top);
                 let rect = D2D_RECT_F { left: x0, top: y0, right: x1, bottom };
@@ -344,9 +325,7 @@ impl PanelRenderer {
                 rt.FillRectangle(&rect, bar_brush);
 
                 let peak_v = self.peak_bars[i].clamp(0.0, 1.0);
-                let peak_mapped = (peak_v * SpectrumDefaults::BAR_GAIN)
-                    .clamp(0.0, 1.0)
-                    .powf(SpectrumDefaults::BAR_POW);
+                let peak_mapped = self.visualization.height(peak_v);
                 let peak_y = (bottom - peak_mapped * inner_h).max(top);
                 let peak_top = (peak_y - UiConfig::PEAK_HEIGHT_PX).max(top);
                 let peak_bottom = (peak_y + UiConfig::PEAK_GAP_PX).min(bottom);
@@ -385,9 +364,7 @@ impl PanelRenderer {
         let step_x = inner_w / (n - 1) as f32;
         let mut points = Vec::with_capacity(n);
         for (i, v) in bars.iter().copied().enumerate() {
-            let v = (v * SpectrumDefaults::BAR_GAIN)
-                .clamp(0.0, 1.0)
-                .powf(SpectrumDefaults::BAR_POW);
+            let v = self.visualization.height(v);
             let h = (v * inner_h).max(UiConfig::MIN_BAR_HEIGHT_PX);
             let x = left + i as f32 * step_x;
             let y = bottom - h;

@@ -78,11 +78,70 @@ Create a `config.json` file in the same directory as the executable:
 - `auto_start`: Enable Windows auto start via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 - `toggle_hotkey`: Optional global shortcut, for example `"Ctrl+Alt+V"`. Omit it, use `null`, or leave it empty to disable. Configuration changes take effect after restart. Both flat configuration and options nested inside `"user"` are supported.
 - `language_file`: Optional JSON file with custom tray menu labels, for example `"locale.json"`. Relative paths are resolved from the executable directory; absolute paths are also accepted. Omit it, use `null`, or leave it blank for built-in English. Changes take effect after restart.
+- `visualization`: Optional frequency range and animation settings, described below. Missing settings use the new, more responsive defaults, including with older configuration files.
 
 UTF-8 files with or without a BOM are supported. Malformed JSON or invalid option
 types fall back to defaults with a warning. An invalid `toggle_hotkey` value only
 disables the shortcut; an invalid `language_file` type only disables custom text.
 Both preserve the other options.
+
+### Frequency range and animation
+
+Add `visualization` to `config.json` (inside `"user"` when using nested configuration).
+Individual settings are optional; restart the app after editing:
+
+```json
+{
+    "visualization": {
+        "min_hz": 40,
+        "max_hz": 16000,
+        "attack_ms": 15,
+        "release_ms": 100,
+        "vis_attack_ms": 20,
+        "vis_release_ms": 65,
+        "bar_gain": 3.6,
+        "peak_fall_per_sec": 2.0
+    }
+}
+```
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `min_hz`, `max_hz` | 40, 16000 | Frequency range distributed across the 50 bars |
+| `attack_ms`, `release_ms` | 15, 100 | Spectrum smoothing on rising and falling energy |
+| `vis_attack_ms`, `vis_release_ms` | 20, 65 | Additional smoothing of the drawn heights |
+| `bar_gain` | 3.6 | Height multiplier before the existing nonlinear mapping |
+| `peak_fall_per_sec` | 2.0 | Peak marker fall speed in normalized height units per second |
+
+Shorter smoothing times give quicker, more pronounced movement. These are
+exponential time constants, not fixed animation durations. Raise gain moderately:
+large gains can keep the display at full height and obscure changes. The settings
+affect bars, lines and peak markers consistently, without changing captured sound
+or microphone volume. Hiding and resuming recreates the visualizer with the same
+settings and fresh animation state.
+
+Values must be finite positive numbers. Invalid fields fall back individually
+with an English warning; a non-object `visualization` uses defaults. If the
+resulting `min_hz` is not below `max_hz`, both limits reset to 40 and 16000 Hz.
+Other user settings are preserved. The effective upper frequency is capped at
+half the device sample rate. Frequencies are bounded for analysis only; this does
+not filter system playback. FFT size remains 1024: at 48 kHz the bin spacing is
+about 46.9 Hz, so lowering `min_hz` does not create extra low-frequency detail.
+
+To restore the previous animation response, use:
+
+```json
+{
+    "visualization": {
+        "attack_ms": 30,
+        "release_ms": 220,
+        "vis_attack_ms": 45,
+        "vis_release_ms": 140,
+        "bar_gain": 3.1,
+        "peak_fall_per_sec": 1.35
+    }
+}
+```
 
 ### Custom UI text
 

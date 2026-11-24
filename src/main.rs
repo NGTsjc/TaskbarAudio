@@ -8,6 +8,7 @@ mod localization;
 mod single_instance;
 mod util;
 mod win32;
+mod visualization;
 
 use crate::single_instance::SingleInstanceGuard;
 use crate::win32::message_loop::MessageLoop;

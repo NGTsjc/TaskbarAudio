@@ -71,7 +71,7 @@ fn resume_keeps_pixel_bounds_and_thicker_bars_at_every_dpi() {
     surface.bitmap =
         unsafe { CreateDIBSection(surface.dc, &info, DIB_RGB_COLORS, &mut bits, None, 0) }.unwrap();
     surface.previous = unsafe { SelectObject(surface.dc, surface.bitmap) };
-    let mut renderer = PanelRenderer::new(surface.hwnd).unwrap();
+    let mut renderer = PanelRenderer::new_with_visualization(surface.hwnd, VisualizationConfig::default()).unwrap();
     let target = unsafe {
         renderer
             .factory
@@ -184,5 +184,29 @@ fn resume_keeps_pixel_bounds_and_thicker_bars_at_every_dpi() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn recreated_renderer_preserves_custom_settings_and_resets_animation() {
+    let hwnd = unsafe {
+        CreateWindowExW(WINDOW_EX_STYLE::default(), w!("STATIC"), w!(""), WS_POPUP,
+            0, 0, UiConfig::PANEL_WIDTH_PX, 48, None, None, None, None)
+    }.unwrap();
+    struct TestWindow(HWND);
+    impl Drop for TestWindow {
+        fn drop(&mut self) { let _ = unsafe { DestroyWindow(self.0) }; }
+    }
+    let _window = TestWindow(hwnd);
+    let settings = VisualizationConfig { min_hz: 80.0, max_hz: 8000.0,
+        vis_attack_ms: 9.0, bar_gain: 4.5, ..Default::default() };
+    for _ in 0..3 {
+        let mut renderer = PanelRenderer::new_with_visualization(hwnd, settings).unwrap();
+        assert_eq!(renderer.visualization, settings);
+        assert!(renderer.bars.iter().chain(&renderer.display_bars).chain(&renderer.peak_bars).all(|&v| v == 0.0));
+        renderer.bars.fill(0.05);
+        renderer.visualization.animate(&renderer.bars, &mut renderer.display_bars, &mut renderer.peak_bars, 0.016);
+        assert!(renderer.display_bars.iter().all(|&v| v > 0.0));
+        // Dropping/recreating mirrors hide/resume and must not retain old peaks.
     }
 }
